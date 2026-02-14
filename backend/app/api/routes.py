@@ -3,9 +3,9 @@ from typing import List, Optional
 from datetime import datetime
 import random
 
-from ..models.incident import Incident, IncidentSeverity, IncidentStatus
-from ..models.agent_messages import AgentStatus
-from ..api.websocket import manager
+from models.incident import Incident, IncidentSeverity, IncidentStatus
+from models.agent_messages import AgentStatus
+from api.websocket import manager
 
 router = APIRouter()
 
@@ -76,26 +76,26 @@ async def get_incident(incident_id: str):
 
 @router.post("/incidents/simulate", response_model=Incident)
 async def simulate_incident(background_tasks: BackgroundTasks, scenario_index: Optional[int] = None):
-    from ..agents.orchestrator import OrchestratorAgent
+    from agents.orchestrator import OrchestratorAgent
+    from agents.monitor_agent import ANOMALY_SCENARIOS
 
-    idx = scenario_index if scenario_index is not None else random.randint(0, len(MOCK_INCIDENTS) - 1)
-    idx = idx % len(MOCK_INCIDENTS)
-    mock = MOCK_INCIDENTS[idx]
+    idx = scenario_index if scenario_index is not None else random.randint(0, len(ANOMALY_SCENARIOS) - 1)
+    idx = idx % len(ANOMALY_SCENARIOS)
+    scenario = ANOMALY_SCENARIOS[idx]
+
+    # Build incident directly from the rich scenario data (includes mock_logs)
+    metrics = dict(scenario["metrics"])
+    if scenario.get("mock_logs"):
+        metrics["mock_logs"] = scenario["mock_logs"]
 
     incident = Incident(
-        title=mock["title"],
-        description=mock["description"],
-        severity=mock["severity"],
-        service=mock["service"],
-        error_count=mock["error_count"],
-        affected_users=mock["affected_users"],
-        metrics_snapshot={
-            "cpu_percent": random.uniform(75, 99),
-            "memory_percent": random.uniform(60, 95),
-            "error_rate": random.uniform(0.05, 0.45),
-            "latency_p99_ms": random.uniform(500, 15000),
-            "request_rate": random.uniform(100, 5000),
-        },
+        title=scenario.get("title", f"[{scenario['severity'].upper()}] {scenario['service']}"),
+        description=scenario["description"],
+        severity=scenario["severity"],
+        service=scenario.get("service", "unknown-service"),
+        error_count=scenario.get("error_count", random.randint(50, 500)),
+        affected_users=scenario.get("affected_users", random.randint(100, 2000)),
+        metrics_snapshot=metrics,
     )
 
     incidents_db[incident.id] = incident

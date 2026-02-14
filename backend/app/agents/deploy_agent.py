@@ -4,8 +4,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from ..models.incident import Incident, Fix, IncidentStatus
-from ..models.agent_messages import AgentStatus
+from models.incident import Incident, Fix, IncidentStatus
+from models.agent_messages import AgentStatus
 
 logger = logging.getLogger(__name__)
 

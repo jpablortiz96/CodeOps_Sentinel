@@ -22,9 +22,16 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = True
 
-    # Simulation mode (no real APIs required)
+    # Simulation mode — set to False when real Azure credentials are present.
+    # FoundryService also auto-detects: if AZURE_OPENAI_KEY is set and
+    # SIMULATION_MODE is False, real GPT-4o calls are made.
     SIMULATION_MODE: bool = True
     SIMULATION_DELAY_MS: int = 800
+
+    # Confidence threshold for automated remediation (0–100 scale).
+    # >= threshold  → auto-fix and deploy
+    # <  threshold  → escalate to human review (skip deploy phase)
+    CONFIDENCE_THRESHOLD: int = 70
 
     class Config:
         env_file = ".env"

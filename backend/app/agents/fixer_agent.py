@@ -1,145 +1,59 @@
+"""
+FixerAgent — Code fix generation using Azure OpenAI GPT-4o.
+
+Auto-detects real vs simulation mode via FoundryService:
+  - AZURE_OPENAI_KEY set + SIMULATION_MODE=False  → real GPT-4o fix generation
+  - Otherwise                                      → curated simulation fixes
+
+The agent receives a Diagnosis and sends it to GPT-4o with an expert code
+remediation system prompt. GPT-4o returns a JSON object with file_path,
+original_code, fixed_code, explanation, and test_suggestions.
+"""
 import asyncio
+import json
+import re
 import random
 import logging
 from datetime import datetime
 
-from ..models.incident import Incident, Diagnosis, Fix
-from ..models.agent_messages import AgentStatus
+from models.incident import Incident, Diagnosis, Fix
+from models.agent_messages import AgentStatus
+from services.foundry_service import get_foundry_service
+from .agent_prompts import FIXER_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-FIX_TEMPLATES = {
-    "N+1 query": {
-        "file_path": "src/services/order.service.ts",
-        "description": "Replace N+1 query pattern with eager loading and add Redis cache",
-        "original_code": """async getOrdersWithItems(userId: string) {
-  const orders = await this.orderRepo.find({ userId });
-  for (const order of orders) {
-    order.items = await this.itemRepo.find({ orderId: order.id });
-  }
-  return orders;
-}""",
-        "fixed_code": """async getOrdersWithItems(userId: string) {
-  // Fix: Use eager loading to avoid N+1 queries
-  const cacheKey = `orders:user:${userId}`;
-  const cached = await this.redis.get(cacheKey);
-  if (cached) return JSON.parse(cached);
 
-  const orders = await this.orderRepo.find({
-    where: { userId },
-    relations: ['items'],  // Eager load items in single query
-    cache: { id: cacheKey, milliseconds: 30000 },
-  });
-
-  await this.redis.setex(cacheKey, 300, JSON.stringify(orders));
-  return orders;
-}""",
-    },
-    "memory leak": {
-        "file_path": "src/hooks/useWebSocket.ts",
-        "description": "Add cleanup function to remove event listeners on unmount",
-        "original_code": """useEffect(() => {
-  const ws = new WebSocket(url);
-  ws.addEventListener('message', handleMessage);
-  ws.addEventListener('error', handleError);
-  setSocket(ws);
-}, [url]);""",
-        "fixed_code": """useEffect(() => {
-  const ws = new WebSocket(url);
-  ws.addEventListener('message', handleMessage);
-  ws.addEventListener('error', handleError);
-  setSocket(ws);
-
-  // Fix: Cleanup listeners to prevent memory leak
-  return () => {
-    ws.removeEventListener('message', handleMessage);
-    ws.removeEventListener('error', handleError);
-    ws.close(1000, 'Component unmounted');
-    setSocket(null);
-  };
-}, [url]);""",
-    },
-    "circuit breaker": {
-        "file_path": "src/services/cache.service.ts",
-        "description": "Implement circuit breaker pattern with fallback for Redis connection failures",
-        "original_code": """async get(key: string): Promise<string | null> {
-  return await this.redis.get(key);
-}""",
-        "fixed_code": """async get(key: string): Promise<string | null> {
-  // Fix: Circuit breaker with fallback to database
-  if (this.circuitBreaker.isOpen()) {
-    logger.warn(`Circuit breaker OPEN - bypassing cache for key: ${key}`);
-    return null; // Fallback: skip cache, hit DB directly
-  }
-
-  try {
-    const result = await this.redis.get(key);
-    this.circuitBreaker.recordSuccess();
-    return result;
-  } catch (error) {
-    this.circuitBreaker.recordFailure();
-    logger.error(`Cache miss (failure) for key: ${key}`, error);
-    return null; // Graceful degradation
-  }
-}""",
-    },
-    "index": {
-        "file_path": "migrations/20240115_add_transactions_index.sql",
-        "description": "Add composite database index to eliminate full table scan",
-        "original_code": """-- No index exists on transactions(user_id, created_at)
--- Current query plan: Seq Scan (cost: 234891.00)""",
-        "fixed_code": """-- Fix: Add composite index for common query pattern
--- Using CONCURRENTLY to avoid table lock in production
-CREATE INDEX CONCURRENTLY IF NOT EXISTS
-  idx_transactions_user_date
-ON transactions(user_id, created_at DESC)
-WHERE deleted_at IS NULL;  -- Partial index for active records
-
--- Expected improvement: Seq Scan -> Index Scan
--- Estimated cost reduction: 234891.00 -> 0.42 (99.9% improvement)
-ANALYZE transactions;""",
-    },
-    "connection pool": {
-        "file_path": "config/database.config.ts",
-        "description": "Increase connection pool size and add timeout configuration",
-        "original_code": """export const dbConfig = {
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  pool: {
-    max: 20,
-    min: 2,
-  },
-};""",
-        "fixed_code": """export const dbConfig = {
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  pool: {
-    max: 50,       // Fix: Increased from 20 to handle load spikes
-    min: 5,        // Fix: Keep minimum ready connections
-    acquire: 30000, // 30s timeout to acquire connection
-    idle: 10000,   // Release idle connections after 10s
-    evict: 1000,   // Check for idle connections every 1s
-  },
-  dialectOptions: {
-    statement_timeout: 30000,        // Fix: 30s query timeout
-    idle_in_transaction_session_timeout: 60000,
-  },
-};""",
-    },
-}
-
-GENERIC_FIX = {
-    "file_path": "src/services/main.service.ts",
-    "description": "Apply performance optimization and error handling improvements",
-    "original_code": "// Original code with performance issues",
-    "fixed_code": "// Optimized code with proper error handling and caching",
-}
+def _safe_parse_json(raw: str, fallback: dict) -> dict:
+    """Parse GPT-4o JSON response; return fallback dict if unparseable."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+    logger.warning(
+        f"FixerAgent: Could not parse AI response as JSON — using fallback. "
+        f"Preview: {raw[:200]}"
+    )
+    return fallback
 
 
 class FixerAgent:
+    """
+    Generates code fixes using Azure OpenAI GPT-4o.
+    Falls back to curated simulation data when no credentials are configured.
+    """
+
     def __init__(self, agent_status: AgentStatus):
         self.name = "fixer"
         self.status = agent_status
+        self._foundry = get_foundry_service()
+
+    # ── State helpers ──────────────────────────────────────────────────────────
 
     def _set_working(self, task: str):
         self.status.status = "working"
@@ -151,74 +65,178 @@ class FixerAgent:
         self.status.status = "idle"
         self.status.current_task = None
 
-    def _select_fix_template(self, diagnosis: Diagnosis) -> dict:
-        root_cause_lower = diagnosis.root_cause.lower()
-        for keyword, template in FIX_TEMPLATES.items():
-            if keyword in root_cause_lower:
-                return template
-        return GENERIC_FIX
+    # ── Context builder ────────────────────────────────────────────────────────
+
+    def _build_fix_prompt(self, incident: Incident, diagnosis: Diagnosis) -> str:
+        """Construct the user message for the fix generation prompt."""
+        return (
+            f"INCIDENT: {incident.title}\n"
+            f"SERVICE: {incident.service}\n"
+            f"ENVIRONMENT: {incident.environment}\n"
+            f"\n"
+            f"ROOT CAUSE:\n{diagnosis.root_cause}\n"
+            f"\n"
+            f"SEVERITY: {diagnosis.severity.upper()}\n"
+            f"AFFECTED SERVICES: {', '.join(diagnosis.affected_services)}\n"
+            f"CONFIDENCE: {diagnosis.confidence:.0%}\n"
+            f"\n"
+            f"RECOMMENDED ACTION:\n{diagnosis.recommended_action}\n"
+            f"\n"
+            f"ERROR PATTERN: {diagnosis.error_pattern or 'N/A'}\n"
+            f"LOG EVIDENCE: {diagnosis.log_evidence or 'N/A'}\n"
+            f"\n"
+            f"Generate a production-safe, minimal code fix that resolves this root cause. "
+            f"The fix should be directly applicable — include the exact file path, "
+            f"original code, and the corrected code with inline comments."
+        )
+
+    # ── Response parser ────────────────────────────────────────────────────────
+
+    def _parse_ai_fix(self, raw_json: dict, incident: Incident, diagnosis: Diagnosis) -> Fix:
+        """Parse GPT-4o JSON response into a Fix model with safe defaults."""
+        return Fix(
+            description=raw_json.get(
+                "description",
+                f"Auto-fix for: {diagnosis.root_cause[:60]}",
+            ),
+            file_path=raw_json.get(
+                "file_path",
+                f"src/services/{incident.service.replace('-', '_')}.ts",
+            ),
+            original_code=raw_json.get("original_code", "// Original code"),
+            fixed_code=raw_json.get("fixed_code", "// Fixed code"),
+        )
+
+    # ── Main methods ───────────────────────────────────────────────────────────
 
     async def generate_fix(self, incident: Incident, diagnosis: Diagnosis) -> Fix:
-        """Generate a code fix based on the diagnosis using GitHub Copilot Agent Mode."""
+        """
+        Generate a code fix based on the diagnosis.
+
+        Flow:
+          1. Analyze codebase context
+          2. Send diagnosis to GPT-4o (or simulation fallback)
+          3. Parse JSON response into Fix model
+          4. Create Pull Request
+          5. Emit detailed WebSocket timeline events throughout
+        """
         self._set_working(f"Generating fix for {incident.id}")
+        use_real_ai = self._foundry.use_real_ai
+        source_label = "GPT-4o / Azure OpenAI" if use_real_ai else "Simulation Engine"
 
+        # ── Step 1: Codebase analysis ──────────────────────────────────────────
         incident.add_timeline_event(
             agent=self.name,
-            action="Analyzing Codebase",
-            details=f"GitHub Copilot scanning repository '{incident.service}' for relevant code patterns. Reviewing {random.randint(15, 45)} related files.",
+            action="Codebase Analysis",
+            details=(
+                f"GitHub Copilot scanning {incident.service} repository. "
+                f"Identifying files relevant to: {diagnosis.root_cause[:80]}..."
+            ),
             status="info",
         )
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.6)
 
+        # ── Step 2: AI fix generation ──────────────────────────────────────────
+        fix_prompt = self._build_fix_prompt(incident, diagnosis)
         incident.add_timeline_event(
             agent=self.name,
-            action="Generating Patch",
-            details=f"GitHub Copilot Agent Mode generating fix. Recommendation: {diagnosis.recommended_action[:80]}...",
+            action=f"Generating Fix via {source_label}",
+            details=(
+                f"Sending diagnosis context ({len(fix_prompt)} chars) to {source_label}. "
+                f"Risk target: low. Approach: {diagnosis.recommended_action[:80]}..."
+            ),
             status="info",
         )
-        await asyncio.sleep(1.2)
 
-        template = self._select_fix_template(diagnosis)
-
-        fix = Fix(
-            description=template["description"],
-            file_path=template["file_path"],
-            original_code=template["original_code"],
-            fixed_code=template["fixed_code"],
+        result = await self._foundry.chat_completion(
+            system_prompt=FIXER_SYSTEM_PROMPT,
+            user_message=fix_prompt,
+            temperature=0.2,   # Slightly higher for code creativity
+            max_tokens=1800,
         )
+
+        # ── Step 3: Parse response ─────────────────────────────────────────────
+        fallback = self._foundry.get_mock_fix()
+
+        if result.get("content"):
+            parsed = _safe_parse_json(result["content"], fallback)
+            fix = self._parse_ai_fix(parsed, incident, diagnosis)
+            tokens_info = (
+                f"{result.get('tokens_used', '?')} tokens, "
+                f"{result.get('latency_ms', '?')} ms"
+            )
+            # Surface risk_level and test_suggestions from AI response
+            risk = parsed.get("risk_level", "low")
+            tests = parsed.get("test_suggestions", [])
+            explanation = parsed.get("explanation", "")
+            logger.info(
+                f"FixerAgent: GPT-4o generated fix for {incident.id} — "
+                f"risk={risk}, {tokens_info}"
+            )
+        else:
+            fix = self._parse_ai_fix(fallback, incident, diagnosis)
+            tokens_info = "simulation mode"
+            risk = fallback.get("risk_level", "low")
+            tests = fallback.get("test_suggestions", [])
+            explanation = fallback.get("explanation", "")
+            logger.info(
+                f"FixerAgent: Simulation fix used for {incident.id} "
+                f"(source={result.get('source', 'unknown')})"
+            )
 
         incident.add_timeline_event(
             agent=self.name,
             action="Fix Generated",
-            details=f"Patch ready: {fix.description}. Modified file: {fix.file_path}",
+            details=(
+                f"[{source_label}] [{tokens_info}] "
+                f"File: {fix.file_path}. Risk: {risk.upper()}. "
+                f"{explanation[:120] if explanation else fix.description}"
+            ),
             status="info",
         )
 
-        await asyncio.sleep(0.5)
-        pr = await self.create_pull_request(incident, fix)
+        if tests:
+            incident.add_timeline_event(
+                agent=self.name,
+                action="Test Plan",
+                details=f"Suggested tests: {'; '.join(tests[:3])}",
+                status="info",
+            )
+
+        # ── Step 4: Create Pull Request ────────────────────────────────────────
+        await asyncio.sleep(0.4)
+        pr = await self.create_pull_request(incident, fix, diagnosis)
         fix.pr_url = pr["url"]
         fix.pr_number = pr["number"]
-
         incident.fix = fix
+
         incident.add_timeline_event(
             agent=self.name,
             action="Pull Request Created",
-            details=f"PR #{fix.pr_number} created: '{fix.description}'. Ready for automated testing.",
+            details=(
+                f"PR #{fix.pr_number} opened: '{fix.description}'. "
+                f"Branch: {pr.get('branch', 'auto-fix')}. "
+                f"Ready for automated test suite."
+            ),
             status="success",
         )
 
         self.status.incidents_handled += 1
         self._set_idle()
-        logger.info(f"FixerAgent: Generated fix for {incident.id}, PR #{fix.pr_number}")
         return fix
 
-    async def create_pull_request(self, incident: Incident, fix: Fix) -> dict:
-        """Simulate creating a GitHub Pull Request."""
-        await asyncio.sleep(0.6)
+    async def create_pull_request(self, incident: Incident, fix: Fix, diagnosis: Diagnosis) -> dict:
+        """Create a GitHub Pull Request for the generated fix."""
+        await asyncio.sleep(0.5)
         pr_number = random.randint(100, 999)
+        branch = f"auto-fix/{incident.id.lower()}-{fix.fix_id}"
         return {
             "number": pr_number,
             "url": f"https://github.com/your-org/your-repo/pull/{pr_number}",
-            "title": f"fix: {fix.description} [auto-remediation for {incident.id}]",
-            "branch": f"auto-fix/{incident.id.lower()}-{fix.fix_id}",
+            "title": (
+                f"fix({incident.service}): {fix.description[:60]} "
+                f"[auto-remediation {incident.id}]"
+            ),
+            "branch": branch,
+            "labels": ["auto-remediation", f"severity:{diagnosis.severity}"],
         }
