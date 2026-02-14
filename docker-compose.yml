@@ -1,0 +1,43 @@
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinel-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - SIMULATION_MODE=true
+    env_file:
+      - ./backend/.env.example
+    volumes:
+      - ./backend/app:/app/app  # Hot reload in dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - sentinel-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sentinel-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    networks:
+      - sentinel-network
+
+networks:
+  sentinel-network:
+    driver: bridge
