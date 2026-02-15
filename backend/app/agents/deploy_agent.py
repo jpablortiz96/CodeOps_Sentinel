@@ -4,10 +4,14 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+import httpx
+
+from config import get_settings
 from models.incident import Incident, Fix, IncidentStatus
 from models.agent_messages import AgentStatus
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 TEST_SUITES = [
     {"name": "Unit Tests", "total": 342, "duration_s": 12},
@@ -187,4 +191,70 @@ class DeployAgent:
             "success": True,
             "rolled_back_to": f"v{random.randint(1, 5)}.{random.randint(0, 50)}.{random.randint(0, 20)}-stable",
             "duration_s": random.randint(60, 120),
+        }
+
+    async def verify_remediation(self, incident: Incident, timeout_s: int = 30) -> dict:
+        """
+        Poll ShopDemo /health every 5 s for up to timeout_s seconds to confirm
+        the app returned to a healthy or degraded state after remediation.
+        """
+        self._set_working("Verifying ShopDemo remediation")
+        base = settings.DEMO_APP_URL
+        interval = 5
+        attempts = max(1, timeout_s // interval)
+
+        incident.add_timeline_event(
+            agent=self.name,
+            action="Verification Started",
+            details=f"Polling {base}/health every {interval}s (max {timeout_s}s).",
+            status="info",
+        )
+
+        last_health: dict = {}
+        for attempt in range(1, attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    resp = await client.get(f"{base}/health")
+                    if resp.status_code == 200:
+                        last_health = resp.json()
+                        status = last_health.get("status", "unknown")
+                        logger.info(
+                            f"[DEPLOY] verify attempt {attempt}/{attempts}: status={status}"
+                        )
+                        if status in ("healthy", "degraded"):
+                            incident.add_timeline_event(
+                                agent=self.name,
+                                action="Remediation Verified",
+                                details=(
+                                    f"ShopDemo status={status} after {attempt * interval}s. "
+                                    f"Memory={last_health.get('memory_usage_mb', '?')} MB, "
+                                    f"CPU={last_health.get('cpu_percent', '?')}%, "
+                                    f"ErrorRate={last_health.get('error_rate', '?')}%."
+                                ),
+                                status="success",
+                            )
+                            self._set_idle()
+                            return {"verified": True, "status": status, "health": last_health, "attempts": attempt}
+            except Exception as exc:
+                logger.warning(f"[DEPLOY] verify attempt {attempt} failed: {exc}")
+
+            if attempt < attempts:
+                await asyncio.sleep(interval)
+
+        # Timeout — still report whatever we got
+        incident.add_timeline_event(
+            agent=self.name,
+            action="Verification Timeout",
+            details=(
+                f"App did not fully recover within {timeout_s}s. "
+                f"Last status: {last_health.get('status', 'unknown')}."
+            ),
+            status="warning",
+        )
+        self._set_idle()
+        return {
+            "verified": False,
+            "status":   last_health.get("status", "unknown"),
+            "health":   last_health,
+            "attempts": attempts,
         }

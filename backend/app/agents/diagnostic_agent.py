@@ -15,10 +15,15 @@ import re
 import logging
 from datetime import datetime
 
+import httpx
+
+from config import get_settings
 from models.incident import Incident, IncidentSeverity, Diagnosis
 from models.agent_messages import AgentStatus
 from services.foundry_service import get_foundry_service
 from .agent_prompts import DIAGNOSTIC_SYSTEM_PROMPT
+
+settings = get_settings()
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +71,33 @@ class DiagnosticAgent:
 
     # ── Context builder ────────────────────────────────────────────────────────
 
-    def _build_incident_context(self, incident: Incident) -> str:
+    async def _fetch_demo_metrics(self) -> dict:
+        """
+        Fetch /metrics (Prometheus text) and /chaos/status from the real demo app.
+        Returns a dict with raw text + chaos experiment state.
+        Falls back gracefully on network errors.
+        """
+        base = settings.DEMO_APP_URL
+        result = {}
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                metrics_resp = await client.get(f"{base}/metrics")
+                if metrics_resp.status_code == 200:
+                    result["prometheus_metrics"] = metrics_resp.text[:2000]
+
+                chaos_resp = await client.get(f"{base}/chaos/status")
+                if chaos_resp.status_code == 200:
+                    result["chaos_status"] = chaos_resp.json()
+        except Exception as exc:
+            logger.warning(f"DiagnosticAgent: demo metrics fetch failed: {exc}")
+        return result
+
+    def _build_incident_context(self, incident: Incident, demo_extra: dict | None = None) -> str:
         """Format incident data as a structured context string for GPT-4o."""
         m = incident.metrics_snapshot
         logs = m.get("mock_logs", "No structured logs captured in this snapshot.")
-        return (
+
+        base = (
             f"INCIDENT ID:        {incident.id}\n"
             f"SERVICE:            {incident.service}\n"
             f"SEVERITY:           {incident.severity.upper()}\n"
@@ -83,16 +110,33 @@ class DiagnosticAgent:
             f"METRICS SNAPSHOT:\n"
             f"  cpu_percent:       {m.get('cpu_percent', 'N/A')}%\n"
             f"  memory_percent:    {m.get('memory_percent', 'N/A')}%\n"
+            f"  memory_usage_mb:   {m.get('memory_usage_mb', 'N/A')} MB\n"
             f"  error_rate:        {m.get('error_rate', 'N/A')}\n"
-            f"  latency_p99_ms:    {m.get('latency_p99_ms', 'N/A')} ms\n"
+            f"  avg_latency_ms:    {m.get('avg_latency_ms', m.get('latency_p99_ms', 'N/A'))} ms\n"
             f"  db_connections:    {m.get('db_connections', 'N/A')}\n"
             f"  restart_count:     {m.get('restart_count', 'N/A')}\n"
             f"  last_exit_code:    {m.get('last_exit_code', 'N/A')}\n"
             f"  replication_lag_s: {m.get('replication_lag_s', 'N/A')} s\n"
             f"  request_rate:      {m.get('request_rate', 'N/A')} req/s\n"
+            f"  active_chaos:      {m.get('active_chaos', 'N/A')}\n"
             f"\n"
             f"RECENT LOGS (last 15 min):\n{logs}\n"
         )
+
+        if demo_extra:
+            chaos = demo_extra.get("chaos_status", {})
+            if chaos.get("any_active"):
+                experiments = chaos.get("experiments", {})
+                active = [
+                    f"{name} (running {info.get('running_for', '?')})"
+                    for name, info in experiments.items()
+                    if info.get("active")
+                ]
+                base += f"\nACTIVE CHAOS EXPERIMENTS:\n  {', '.join(active)}\n"
+            if demo_extra.get("prometheus_metrics"):
+                base += f"\nPROMETHEUS METRICS (live):\n{demo_extra['prometheus_metrics']}\n"
+
+        return base
 
     # ── Response parser ────────────────────────────────────────────────────────
 
@@ -175,7 +219,20 @@ class DiagnosticAgent:
         await asyncio.sleep(0.4)
 
         # ── Step 3: AI analysis ────────────────────────────────────────────────
-        context = self._build_incident_context(incident)
+        demo_extra = None
+        if incident.service == "shopdemo":
+            demo_extra = await self._fetch_demo_metrics()
+            if demo_extra:
+                incident.add_timeline_event(
+                    agent=self.name,
+                    action="Live Demo-App Metrics Fetched",
+                    details=(
+                        f"Fetched /metrics and /chaos/status from ShopDemo. "
+                        f"Chaos active: {demo_extra.get('chaos_status', {}).get('any_active', False)}"
+                    ),
+                    status="info",
+                )
+        context = self._build_incident_context(incident, demo_extra)
         incident.add_timeline_event(
             agent=self.name,
             action=f"Sending Context to {source_label}",

@@ -17,7 +17,8 @@
       "Bash(npm run build:*)",
       "Bash(pip install:*)",
       "Bash(python -c:*)",
-      "Bash(Remove-Item -Recurse -Force \"C:\\\\Users\\\\jpabl\\\\CodeOps_Sentinel\\\\demo-app\\\\.tmp_deps\")"
+      "Bash(Remove-Item -Recurse -Force \"C:\\\\Users\\\\jpabl\\\\CodeOps_Sentinel\\\\demo-app\\\\.tmp_deps\")",
+      "Bash(node -e:*)"
     ]
   }
 }

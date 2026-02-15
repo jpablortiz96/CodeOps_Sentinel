@@ -51,8 +51,14 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
 
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
+_monitor_stop_event: asyncio.Event | None = None
+_monitor_task: asyncio.Task | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _monitor_stop_event, _monitor_task
+
     logger.info(json.dumps({
         "event":      "startup",
         "app":        settings.APP_NAME,
@@ -96,7 +102,38 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"MCP Server init skipped: {e}")
 
+    # Start demo-app background monitor
+    try:
+        from agents.monitor_agent import MonitorAgent
+        from api.routes import incidents_db, agent_statuses
+
+        _monitor_stop_event = asyncio.Event()
+        _monitor_agent = MonitorAgent(agent_statuses["monitor"])
+        _monitor_task = asyncio.create_task(
+            _monitor_agent.background_poll(
+                incidents_db=incidents_db,
+                agent_statuses=agent_statuses,
+                stop_event=_monitor_stop_event,
+            )
+        )
+        logger.info(
+            f"Demo-app monitor started — polling {settings.DEMO_APP_URL} "
+            f"every {settings.MONITORING_INTERVAL_SECONDS}s"
+        )
+    except Exception as e:
+        logger.warning(f"Demo-app monitor start skipped: {e}")
+
     yield
+
+    # Stop background monitor on shutdown
+    if _monitor_stop_event:
+        _monitor_stop_event.set()
+    if _monitor_task and not _monitor_task.done():
+        try:
+            await asyncio.wait_for(_monitor_task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _monitor_task.cancel()
+
     logger.info(json.dumps({"event": "shutdown", "app": settings.APP_NAME}))
 
 

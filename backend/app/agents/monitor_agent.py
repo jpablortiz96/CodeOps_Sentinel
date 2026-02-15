@@ -4,17 +4,117 @@ MonitorAgent — Detects production anomalies via Azure Monitor.
 Includes 8 realistic incident scenarios with production-grade mock logs,
 trace IDs, and service topology context that feed directly into the
 DiagnosticAgent's GPT-4o context.
+
+Also polls the real ShopDemo app health endpoint every
+MONITORING_INTERVAL_SECONDS and fires incidents automatically when
+anomalies are detected.
 """
 import asyncio
 import random
 import logging
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
 
+import httpx
+
+from config import get_settings
 from models.incident import Incident, IncidentSeverity
 from models.agent_messages import AgentStatus
 
+settings = get_settings()
+
 logger = logging.getLogger(__name__)
+
+# ─── Real-time metric history (last 60 readings ≈ 10 min at 10 s interval) ────
+metric_history: deque = deque(maxlen=60)
+
+# ─── Real demo-app polling ─────────────────────────────────────────────────────
+
+async def poll_demo_app() -> Optional[dict]:
+    """
+    Fetch /health from the real ShopDemo app.
+    Returns the parsed JSON or None on network error.
+    """
+    url = f"{settings.DEMO_APP_URL}/health"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            data["_polled_at"] = datetime.utcnow().isoformat()
+            metric_history.append(data)
+            return data
+    except Exception as exc:
+        logger.warning(f"[MONITOR] poll_demo_app failed: {exc}")
+        return None
+
+
+def classify_demo_health(health: dict) -> Optional[dict]:
+    """
+    Compare health snapshot against configured thresholds.
+    Returns an anomaly dict if any threshold is breached, else None.
+    """
+    mem   = health.get("memory_usage_mb", 0)
+    cpu   = health.get("cpu_percent", 0)
+    err   = health.get("error_rate", 0)          # already in %
+    lat   = health.get("avg_latency_ms", 0)
+    chaos = health.get("active_chaos", [])
+    status = health.get("status", "healthy")
+
+    if status == "healthy":
+        return None
+
+    issues = []
+    severity = IncidentSeverity.LOW
+
+    if mem > settings.ALERT_MEMORY_MB_CRITICAL:
+        issues.append(f"memory {mem:.0f} MB > {settings.ALERT_MEMORY_MB_CRITICAL:.0f} MB")
+        severity = IncidentSeverity.CRITICAL
+    elif mem > settings.ALERT_MEMORY_MB_DEGRADED:
+        issues.append(f"memory {mem:.0f} MB elevated")
+        severity = max(severity, IncidentSeverity.HIGH, key=lambda s: ["low","medium","high","critical"].index(s))
+
+    if cpu > settings.ALERT_CPU_PERCENT_CRITICAL:
+        issues.append(f"CPU {cpu:.0f}% > {settings.ALERT_CPU_PERCENT_CRITICAL:.0f}%")
+        severity = IncidentSeverity.CRITICAL
+    elif cpu > settings.ALERT_CPU_PERCENT_DEGRADED:
+        issues.append(f"CPU {cpu:.0f}% elevated")
+
+    err_frac = err / 100.0  # health endpoint returns %, thresholds use fraction
+    if err_frac > settings.ALERT_ERROR_RATE_CRITICAL:
+        issues.append(f"error rate {err:.1f}% > {settings.ALERT_ERROR_RATE_CRITICAL*100:.0f}%")
+        severity = IncidentSeverity.CRITICAL
+    elif err_frac > settings.ALERT_ERROR_RATE_DEGRADED:
+        issues.append(f"error rate {err:.1f}% elevated")
+        if severity == IncidentSeverity.LOW:
+            severity = IncidentSeverity.HIGH
+
+    if lat > settings.ALERT_LATENCY_MS_CRITICAL:
+        issues.append(f"latency {lat:.0f} ms > {settings.ALERT_LATENCY_MS_CRITICAL:.0f} ms")
+        if severity == IncidentSeverity.LOW:
+            severity = IncidentSeverity.HIGH
+    elif lat > settings.ALERT_LATENCY_MS_DEGRADED:
+        issues.append(f"latency {lat:.0f} ms elevated")
+
+    if chaos:
+        issues.append(f"active chaos: {', '.join(chaos)}")
+
+    if not issues:
+        return None
+
+    return {
+        "severity":    severity,
+        "issues":      issues,
+        "chaos":       chaos,
+        "metrics": {
+            "memory_usage_mb": mem,
+            "cpu_percent":     cpu,
+            "error_rate":      err_frac,
+            "avg_latency_ms":  lat,
+            "status":          status,
+        },
+    }
 
 MOCK_SERVICES = [
     "payment-service",
@@ -444,3 +544,111 @@ class MonitorAgent:
             error_count=scenario.get("error_count", 0),
             mock_logs=scenario.get("mock_logs", ""),
         )
+
+    async def create_demo_incident(self, health: dict, anomaly: dict) -> Incident:
+        """Create an incident from a real demo-app health anomaly."""
+        chaos = anomaly.get("chaos", [])
+        chaos_str = f" Chaos active: {', '.join(chaos)}." if chaos else ""
+        description = (
+            f"ShopDemo anomaly detected: {'; '.join(anomaly['issues'])}.{chaos_str} "
+            f"Status: {health.get('status', 'unknown')}."
+        )
+        title_prefix = {
+            IncidentSeverity.CRITICAL: "[CRITICAL]",
+            IncidentSeverity.HIGH:     "[HIGH]",
+            IncidentSeverity.MEDIUM:   "[MEDIUM]",
+            IncidentSeverity.LOW:      "[LOW]",
+        }[anomaly["severity"]]
+
+        chaos_type = chaos[0].replace("_active", "") if chaos else "anomaly"
+        title = f"{title_prefix} ShopDemo — {chaos_type.replace('_', ' ').title()} detected"
+
+        metrics = dict(anomaly["metrics"])
+        metrics["active_chaos"] = chaos
+
+        return await self.create_incident(
+            service="shopdemo",
+            title=title,
+            description=description,
+            severity=anomaly["severity"],
+            metrics=metrics,
+            affected_users=0,
+            error_count=int(health.get("request_count", 0) * health.get("error_rate", 0) / 100),
+        )
+
+    async def background_poll(
+        self,
+        incidents_db: dict,
+        agent_statuses: dict,
+        stop_event: asyncio.Event,
+    ) -> None:
+        """
+        Continuously poll ShopDemo /health and auto-create + remediate incidents.
+        Runs as a background asyncio task (started in main.py lifespan).
+        """
+        from api.websocket import manager as ws_manager
+
+        logger.info(
+            f"[MONITOR] Background polling started — "
+            f"interval={settings.MONITORING_INTERVAL_SECONDS}s "
+            f"target={settings.DEMO_APP_URL}"
+        )
+        _last_incident_id: Optional[str] = None
+
+        while not stop_event.is_set():
+            try:
+                health = await poll_demo_app()
+                if health:
+                    # Broadcast live metrics to dashboard
+                    await ws_manager.broadcast_event(
+                        event_type="demo_app_metrics",
+                        data={
+                            "status":          health.get("status"),
+                            "memory_usage_mb": health.get("memory_usage_mb"),
+                            "cpu_percent":     health.get("cpu_percent"),
+                            "error_rate":      health.get("error_rate"),
+                            "avg_latency_ms":  health.get("avg_latency_ms"),
+                            "active_chaos":    health.get("active_chaos", []),
+                            "request_count":   health.get("request_count"),
+                            "polled_at":       health.get("_polled_at"),
+                        },
+                    )
+
+                    anomaly = classify_demo_health(health)
+                    if anomaly and _last_incident_id is None:
+                        # Create incident and hand off to orchestrator
+                        incident = await self.create_demo_incident(health, anomaly)
+                        incidents_db[incident.id] = incident
+                        _last_incident_id = incident.id
+                        logger.warning(
+                            f"[MONITOR] New demo-app incident {incident.id}: "
+                            f"{'; '.join(anomaly['issues'])}"
+                        )
+
+                        # Trigger orchestrator pipeline
+                        try:
+                            from agents.orchestrator import OrchestratorAgent
+                            orch = OrchestratorAgent(
+                                incidents_db=incidents_db,
+                                agent_statuses=agent_statuses,
+                            )
+                            asyncio.create_task(orch.handle_incident(incident))
+                        except Exception as orch_err:
+                            logger.error(f"[MONITOR] Orchestrator launch failed: {orch_err}")
+
+                    elif health.get("status") == "healthy":
+                        # Reset so the next anomaly creates a fresh incident
+                        _last_incident_id = None
+
+            except Exception as poll_err:
+                logger.error(f"[MONITOR] Poll loop error: {poll_err}", exc_info=True)
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(stop_event.wait()),
+                    timeout=settings.MONITORING_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass  # normal — just time for next poll
+
+        logger.info("[MONITOR] Background polling stopped.")

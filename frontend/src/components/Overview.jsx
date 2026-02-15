@@ -1,12 +1,114 @@
-import { useMemo } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 import {
   Activity, AlertTriangle, CheckCircle, Clock,
-  Cpu, TrendingUp, Zap, Shield,
+  Cpu, TrendingUp, Zap, Shield, MemoryStick, Gauge, Radio,
 } from 'lucide-react'
 import AnimatedNumber from './common/AnimatedNumber'
 import StatusBadge from './common/StatusBadge'
 import GlowCard from './common/GlowCard'
 import { formatDuration, formatTime, formatRelative, formatSeverity } from '../utils/formatters'
+
+/* ─── Demo App Gauge ────────────────────────────────────────────────────────── */
+function DemoAppGauge({ label, value, max, unit = '', color = 'blue', icon: Icon }) {
+  const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0
+  const colorMap = {
+    blue:   { text: 'text-neon-blue',   bar: 'bg-neon-blue',   glow: 'shadow-neon-blue/40'  },
+    green:  { text: 'text-neon-green',  bar: 'bg-neon-green',  glow: 'shadow-neon-green/40' },
+    red:    { text: 'text-neon-red',    bar: 'bg-neon-red',    glow: 'shadow-neon-red/40'   },
+    yellow: { text: 'text-yellow-400',  bar: 'bg-yellow-400',  glow: 'shadow-yellow-400/40' },
+    orange: { text: 'text-orange-400',  bar: 'bg-orange-400',  glow: 'shadow-orange-400/40' },
+  }
+  const c = colorMap[color] ?? colorMap.blue
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          {Icon && <Icon size={13} className={`${c.text} flex-shrink-0`} />}
+          <span className="text-xs text-gray-400 font-mono">{label}</span>
+        </div>
+        <span className={`text-xs font-bold font-mono ${c.text}`}>
+          {typeof value === 'number' ? value.toFixed(value < 10 ? 2 : 1) : '—'}{unit}
+        </span>
+      </div>
+      <div className="h-1.5 rounded-full bg-dark-600 overflow-hidden">
+        <div
+          className={`h-full rounded-full transition-all duration-700 ${c.bar}`}
+          style={{ width: `${pct}%`, boxShadow: pct > 70 ? `0 0 6px var(--tw-shadow-color)` : 'none' }}
+        />
+      </div>
+    </div>
+  )
+}
+
+/* ─── Monitored App Panel ────────────────────────────────────────────────────── */
+function MonitoredApp({ metrics }) {
+  const statusColor = {
+    healthy:  'text-neon-green border-neon-green/30 bg-neon-green/10',
+    degraded: 'text-yellow-400 border-yellow-400/30 bg-yellow-400/10',
+    critical: 'text-neon-red border-neon-red/30 bg-neon-red/10 animate-pulse',
+    unknown:  'text-gray-500 border-dark-400 bg-dark-700',
+  }
+
+  const status  = metrics?.status ?? 'unknown'
+  const memory  = metrics?.memory_usage_mb  ?? null
+  const cpu     = metrics?.cpu_percent      ?? null
+  const errRate = metrics?.error_rate       ?? null   // already %
+  const latency = metrics?.avg_latency_ms   ?? null
+  const chaos   = metrics?.active_chaos     ?? []
+
+  const memColor  = memory  > 400 ? 'red' : memory  > 200 ? 'orange' : 'green'
+  const cpuColor  = cpu     > 85  ? 'red' : cpu     > 60  ? 'orange' : 'blue'
+  const errColor  = errRate > 30  ? 'red' : errRate > 10  ? 'orange' : 'green'
+  const latColor  = latency > 2000? 'red' : latency > 500 ? 'orange' : 'blue'
+
+  return (
+    <GlowCard color={status === 'critical' ? 'red' : status === 'degraded' ? 'yellow' : 'green'}>
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Radio size={14} className="text-neon-blue animate-pulse" />
+          <p className="section-title">Monitored App — ShopDemo</p>
+        </div>
+        <span className={`text-xs font-bold font-mono px-2 py-0.5 rounded-lg border ${statusColor[status] ?? statusColor.unknown}`}>
+          {status.toUpperCase()}
+        </span>
+      </div>
+
+      {metrics ? (
+        <>
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 mb-3">
+            <DemoAppGauge label="Memory"     value={memory}  max={600}  unit=" MB" color={memColor}  icon={MemoryStick} />
+            <DemoAppGauge label="CPU"        value={cpu}     max={100}  unit="%"   color={cpuColor}  icon={Cpu} />
+            <DemoAppGauge label="Error Rate" value={errRate} max={100}  unit="%"   color={errColor}  icon={AlertTriangle} />
+            <DemoAppGauge label="Latency"    value={latency} max={5000} unit=" ms" color={latColor}  icon={Gauge} />
+          </div>
+
+          {chaos.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {chaos.map(exp => (
+                <span
+                  key={exp}
+                  className="text-xs font-mono px-2 py-0.5 rounded-md border border-neon-red/40 bg-neon-red/10 text-neon-red"
+                >
+                  ⚡ {exp.replace(/_active$/, '').replace(/_/g, '-')}
+                </span>
+              ))}
+            </div>
+          )}
+
+          <p className="text-xs text-gray-600 font-mono mt-3">
+            req count: {metrics.request_count ?? '—'} · polled {metrics.polled_at ? new Date(metrics.polled_at).toLocaleTimeString() : '—'}
+          </p>
+        </>
+      ) : (
+        <div className="flex items-center gap-2 py-3 text-gray-500">
+          <Activity size={14} className="animate-pulse" />
+          <span className="text-xs font-mono">Waiting for first poll…</span>
+        </div>
+      )}
+    </GlowCard>
+  )
+}
 
 /* ─── Stat Card ─────────────────────────────────────────────────────────────── */
 function StatCard({ icon: Icon, label, value, suffix = '', color = 'blue', trend, sub }) {
@@ -155,6 +257,15 @@ function IncidentBanner({ incident }) {
 
 /* ─── Overview ───────────────────────────────────────────────────────────────── */
 export default function Overview({ incidents = [], currentIncident, registryAgents = [], wsEvents = [] }) {
+  // Extract latest demo_app_metrics from the WebSocket event stream
+  const demoMetrics = useMemo(() => {
+    for (let i = wsEvents.length - 1; i >= 0; i--) {
+      if (wsEvents[i].type === 'demo_app_metrics' || wsEvents[i].event_type === 'demo_app_metrics') {
+        return wsEvents[i].data ?? wsEvents[i]
+      }
+    }
+    return null
+  }, [wsEvents])
   const stats = useMemo(() => {
     const total     = incidents.length
     const resolved  = incidents.filter(i => i.status === 'resolved').length
@@ -213,6 +324,9 @@ export default function Overview({ incidents = [], currentIncident, registryAgen
           sub="Mean time to resolve"
         />
       </div>
+
+      {/* ── Monitored App ── */}
+      <MonitoredApp metrics={demoMetrics} />
 
       {/* ── Current Incident ── */}
       <GlowCard color={currentIncident ? 'red' : 'green'}>

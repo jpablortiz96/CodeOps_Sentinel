@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     # <  threshold  → escalate to human review (skip deploy phase)
     CONFIDENCE_THRESHOLD: int = 70
 
+    # Demo App — ShopDemo e-commerce target monitored by CodeOps Sentinel
+    DEMO_APP_URL: str = "https://shopdemo.wonderfulocean-93fc426c.eastus.azurecontainerapps.io"
+    MONITORING_INTERVAL_SECONDS: int = 10
+
+    # Alert thresholds (mirrors demo-app health logic)
+    ALERT_MEMORY_MB_CRITICAL: float = 400.0
+    ALERT_MEMORY_MB_DEGRADED: float = 200.0
+    ALERT_CPU_PERCENT_CRITICAL: float = 85.0
+    ALERT_CPU_PERCENT_DEGRADED: float = 60.0
+    ALERT_ERROR_RATE_CRITICAL: float = 0.30   # 30%
+    ALERT_ERROR_RATE_DEGRADED: float = 0.10   # 10%
+    ALERT_LATENCY_MS_CRITICAL: float = 2000.0
+    ALERT_LATENCY_MS_DEGRADED: float = 500.0
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

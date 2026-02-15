@@ -366,6 +366,16 @@ class OrchestratorAgent:
                 f"PR #{fix.pr_number}: '{fix.description}'. File: {fix.file_path}. ({s4_ms}ms)",
                 incident.id, elapsed_ms=s4_ms,
             )
+
+            # ── ShopDemo: apply immediate remediation (stop chaos) ────────────
+            if incident.service == "shopdemo":
+                remed = await self.fixer.remediate_demo_app(incident, diagnosis)
+                await self._broadcast(
+                    "fixer", "ShopDemo Chaos Stopped",
+                    f"POST /chaos/stop → stopped={remed.get('stopped', [])} "
+                    f"new_status={remed.get('new_status', '?')}",
+                    incident.id,
+                )
             await asyncio.sleep(0.2)
 
             # ── Step 5: Validate fix ──────────────────────────────────────────
@@ -478,11 +488,24 @@ class OrchestratorAgent:
             await self._planner.start_step(plan, 7)
             self._registry.update_status("monitor", "working", "Verifying resolution")
 
-            mcp_r = await self._mcp.call_tool(
-                "monitor.check_health",
-                {"service": incident.service, "include_metrics": True},
-                correlation_id=corr_id, incident_id=incident.id,
-            )
+            if incident.service == "shopdemo":
+                # Real health check against the actual demo app
+                verify = await self.deploy.verify_remediation(incident, timeout_s=30)
+                mcp_r = {"result": verify}
+                verified_status = verify.get("status", "unknown")
+                await self._broadcast(
+                    "deploy", "ShopDemo Health Verified",
+                    f"Status={verified_status} after remediation. "
+                    f"Attempts={verify.get('attempts', '?')}.",
+                    incident.id,
+                )
+            else:
+                mcp_r = await self._mcp.call_tool(
+                    "monitor.check_health",
+                    {"service": incident.service, "include_metrics": True},
+                    correlation_id=corr_id, incident_id=incident.id,
+                )
+
             s7_ms = self._ms(s7_start)
             await self._planner.complete_step(plan, 7, mcp_r, s7_ms)
             self._registry.update_status("monitor", "idle")

@@ -4,11 +4,15 @@ from typing import List, Optional
 from datetime import datetime
 import random
 
+import httpx
+
+from config import get_settings
 from models.incident import Incident, IncidentSeverity, IncidentStatus
 from models.agent_messages import AgentStatus
 from api.websocket import manager
 
 router = APIRouter()
+settings = get_settings()
 
 # In-memory store for demo
 incidents_db: dict[str, Incident] = {}
@@ -239,3 +243,149 @@ async def stream_mcp_tool(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Demo App proxy endpoints ───────────────────────────────────────────────────
+
+@router.get("/demo-app/health")
+async def demo_app_health():
+    """Proxy /health from the real ShopDemo app."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(f"{settings.DEMO_APP_URL}/health")
+            return resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ShopDemo unreachable: {exc}")
+
+
+@router.get("/demo-app/metrics")
+async def demo_app_metrics():
+    """Proxy /metrics (Prometheus text) from the real ShopDemo app."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(f"{settings.DEMO_APP_URL}/metrics")
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(content=resp.text, status_code=resp.status_code)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ShopDemo unreachable: {exc}")
+
+
+@router.get("/demo-app/chaos/status")
+async def demo_app_chaos_status():
+    """Proxy /chaos/status from the real ShopDemo app."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(f"{settings.DEMO_APP_URL}/chaos/status")
+            return resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ShopDemo unreachable: {exc}")
+
+
+@router.post("/chaos/inject/{experiment}")
+async def inject_chaos(experiment: str, background_tasks: BackgroundTasks):
+    """
+    Inject a chaos experiment into the real ShopDemo app AND trigger the
+    auto-remediation pipeline so the dashboard shows the full agent flow.
+
+    experiment: memory-leak | cpu-spike | latency | error-rate | db-connection
+    """
+    valid = {"memory-leak", "cpu-spike", "latency", "error-rate", "db-connection"}
+    if experiment not in valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown experiment '{experiment}'. Valid: {sorted(valid)}",
+        )
+
+    # 1. Inject chaos into ShopDemo
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{settings.DEMO_APP_URL}/chaos/{experiment}")
+            chaos_result = resp.json() if resp.status_code == 200 else {"status": "error"}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ShopDemo unreachable: {exc}")
+
+    # 2. Create a matching incident and kick off the orchestrator pipeline
+    exp_to_scenario = {
+        "memory-leak":    ("memory_leak",   IncidentSeverity.HIGH),
+        "cpu-spike":      ("cpu_spike",     IncidentSeverity.CRITICAL),
+        "latency":        ("latency_spike", IncidentSeverity.HIGH),
+        "error-rate":     ("high_error_rate", IncidentSeverity.HIGH),
+        "db-connection":  ("connection_pool_exhausted", IncidentSeverity.HIGH),
+    }
+    scenario_type, severity = exp_to_scenario[experiment]
+    incident = Incident(
+        title=f"[{severity.upper()}] ShopDemo — {experiment} chaos injected",
+        description=(
+            f"Chaos experiment '{experiment}' was manually injected into ShopDemo. "
+            f"CodeOps Sentinel is auto-remediating."
+        ),
+        severity=severity,
+        service="shopdemo",
+        metrics_snapshot={"chaos_experiment": experiment, "active_chaos": [experiment]},
+        error_count=0,
+        affected_users=0,
+    )
+    incidents_db[incident.id] = incident
+
+    from agents.orchestrator import OrchestratorAgent
+    orchestrator = OrchestratorAgent(incidents_db=incidents_db, agent_statuses=agent_statuses)
+    background_tasks.add_task(orchestrator.handle_incident, incident)
+
+    return {
+        "incident_id":  incident.id,
+        "experiment":   experiment,
+        "chaos_result": chaos_result,
+        "status":       "injected — pipeline started",
+    }
+
+
+@router.post("/chaos/stop")
+async def stop_all_chaos():
+    """Stop ALL active chaos experiments in the real ShopDemo app."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{settings.DEMO_APP_URL}/chaos/stop")
+            return resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ShopDemo unreachable: {exc}")
+
+
+# ── Monitoring history & thresholds ───────────────────────────────────────────
+
+@router.get("/monitoring/history")
+async def monitoring_history(limit: int = 60):
+    """Return recent demo-app health readings collected by the background poller."""
+    from agents.monitor_agent import metric_history
+    readings = list(metric_history)[-limit:]
+    return {
+        "count":    len(readings),
+        "readings": readings,
+        "demo_app_url": settings.DEMO_APP_URL,
+    }
+
+
+@router.get("/monitoring/thresholds")
+async def monitoring_thresholds():
+    """Return the alert thresholds currently configured for the demo app."""
+    return {
+        "demo_app_url":               settings.DEMO_APP_URL,
+        "monitoring_interval_seconds": settings.MONITORING_INTERVAL_SECONDS,
+        "thresholds": {
+            "memory_mb": {
+                "critical": settings.ALERT_MEMORY_MB_CRITICAL,
+                "degraded":  settings.ALERT_MEMORY_MB_DEGRADED,
+            },
+            "cpu_percent": {
+                "critical": settings.ALERT_CPU_PERCENT_CRITICAL,
+                "degraded":  settings.ALERT_CPU_PERCENT_DEGRADED,
+            },
+            "error_rate": {
+                "critical": settings.ALERT_ERROR_RATE_CRITICAL,
+                "degraded":  settings.ALERT_ERROR_RATE_DEGRADED,
+            },
+            "latency_ms": {
+                "critical": settings.ALERT_LATENCY_MS_CRITICAL,
+                "degraded":  settings.ALERT_LATENCY_MS_DEGRADED,
+            },
+        },
+    }

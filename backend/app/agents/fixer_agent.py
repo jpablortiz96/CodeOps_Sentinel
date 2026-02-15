@@ -16,12 +16,16 @@ import random
 import logging
 from datetime import datetime
 
+import httpx
+
+from config import get_settings
 from models.incident import Incident, Diagnosis, Fix
 from models.agent_messages import AgentStatus
 from services.foundry_service import get_foundry_service
 from .agent_prompts import FIXER_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
 def _safe_parse_json(raw: str, fallback: dict) -> dict:
@@ -224,6 +228,64 @@ class FixerAgent:
         self.status.incidents_handled += 1
         self._set_idle()
         return fix
+
+    async def remediate_demo_app(self, incident: Incident, diagnosis: Diagnosis) -> dict:
+        """
+        Immediately remediate a real ShopDemo anomaly by calling POST /chaos/stop.
+        Returns a result dict with success flag and new health status.
+        """
+        self._set_working("Remediating ShopDemo via /chaos/stop")
+        base = settings.DEMO_APP_URL
+
+        incident.add_timeline_event(
+            agent=self.name,
+            action="Demo-App Remediation",
+            details=f"Calling POST {base}/chaos/stop to stop all active chaos experiments.",
+            status="info",
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                stop_resp = await client.post(f"{base}/chaos/stop")
+                stop_data = stop_resp.json() if stop_resp.status_code == 200 else {}
+
+                # Verify health after stopping chaos
+                await asyncio.sleep(2)
+                health_resp = await client.get(f"{base}/health")
+                health_data = health_resp.json() if health_resp.status_code == 200 else {}
+
+            new_status = health_data.get("status", "unknown")
+            stopped = stop_data.get("stopped", [])
+            success = new_status in ("healthy", "degraded") and stop_resp.status_code == 200
+
+            incident.add_timeline_event(
+                agent=self.name,
+                action="Chaos Stopped" if success else "Remediation Partial",
+                details=(
+                    f"Stopped experiments: {', '.join(stopped) if stopped else 'none'}. "
+                    f"New status: {new_status}."
+                ),
+                status="success" if success else "warning",
+            )
+            logger.info(
+                f"[FIXER] remediate_demo_app: stopped={stopped} new_status={new_status}"
+            )
+            return {
+                "success":    success,
+                "stopped":    stopped,
+                "new_status": new_status,
+                "health":     health_data,
+            }
+
+        except Exception as exc:
+            logger.error(f"[FIXER] remediate_demo_app failed: {exc}")
+            incident.add_timeline_event(
+                agent=self.name,
+                action="Remediation Error",
+                details=str(exc),
+                status="error",
+            )
+            return {"success": False, "error": str(exc)}
 
     async def create_pull_request(self, incident: Incident, fix: Fix, diagnosis: Diagnosis) -> dict:
         """Create a GitHub Pull Request for the generated fix."""
