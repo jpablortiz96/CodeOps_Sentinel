@@ -14,7 +14,10 @@
       "Bash(az monitor log-analytics workspace list:*)",
       "Bash(az monitor log-analytics query:*)",
       "Bash(az extension add:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(pip install:*)",
+      "Bash(python -c:*)",
+      "Bash(Remove-Item -Recurse -Force \"C:\\\\Users\\\\jpabl\\\\CodeOps_Sentinel\\\\demo-app\\\\.tmp_deps\")"
     ]
   }
 }
