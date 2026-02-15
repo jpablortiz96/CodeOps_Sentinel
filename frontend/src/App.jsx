@@ -1,20 +1,29 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import Dashboard from './components/Dashboard.jsx'
 
-const WS_URL = 'ws://localhost:8000/ws'
+const WS_URL  = 'ws://localhost:8000/ws'
 const API_URL = 'http://localhost:8000/api'
 
 export default function App() {
-  const [incidents, setIncidents] = useState([])
+  const [incidents, setIncidents]         = useState([])
   const [agentStatuses, setAgentStatuses] = useState({
-    monitor: { agent_name: 'monitor', status: 'idle', last_action: null, incidents_handled: 0 },
+    monitor:    { agent_name: 'monitor',    status: 'idle', last_action: null, incidents_handled: 0 },
     diagnostic: { agent_name: 'diagnostic', status: 'idle', last_action: null, incidents_handled: 0 },
-    fixer: { agent_name: 'fixer', status: 'idle', last_action: null, incidents_handled: 0 },
-    deploy: { agent_name: 'deploy', status: 'idle', last_action: null, incidents_handled: 0 },
+    fixer:      { agent_name: 'fixer',      status: 'idle', last_action: null, incidents_handled: 0 },
+    deploy:     { agent_name: 'deploy',     status: 'idle', last_action: null, incidents_handled: 0 },
   })
-  const [wsConnected, setWsConnected] = useState(false)
-  const [events, setEvents] = useState([])
+  const [wsConnected, setWsConnected]     = useState(false)
+  const [events, setEvents]               = useState([])
   const [activeIncident, setActiveIncident] = useState(null)
+
+  // ── New state for MCP + Agent Framework ──────────────────────────────────────
+  // MCP call events (mcp_call + mcp_response from WebSocket)
+  const [mcpEvents, setMcpEvents]         = useState([])
+  // Current execution plan (from plan_created / plan_step_update events)
+  const [executionPlan, setExecutionPlan] = useState(null)
+  // Agent registry data (fetched from /agents/registry)
+  const [registryAgents, setRegistryAgents] = useState([])
+
   const wsRef = useRef(null)
   const reconnectTimer = useRef(null)
 
@@ -22,11 +31,49 @@ export default function App() {
     setEvents(prev => [event, ...prev].slice(0, 100))
   }, [])
 
+  // ── MCP event handlers ────────────────────────────────────────────────────────
+
+  const handleMcpCall = useCallback((msg) => {
+    const data = msg.data || {}
+    // Add to MCP events list; mcp_call creates entry, mcp_response updates it
+    if (msg.event_type === 'mcp_call') {
+      setMcpEvents(prev => {
+        // Don't add duplicate call_ids
+        if (prev.find(e => e.call_id === data.call_id)) return prev
+        return [...prev, data].slice(-200)  // keep last 200
+      })
+    } else if (msg.event_type === 'mcp_response') {
+      setMcpEvents(prev =>
+        prev.map(e => e.call_id === data.call_id ? { ...e, ...data } : e)
+      )
+    }
+  }, [])
+
+  const handlePlanEvent = useCallback((msg) => {
+    if (msg.event_type === 'plan_created') {
+      setExecutionPlan(msg.data)
+    } else if (msg.event_type === 'plan_step_update') {
+      const { plan_id, step, plan_status, current_step_num } = msg.data
+      setExecutionPlan(prev => {
+        if (!prev || prev.plan_id !== plan_id) return prev
+        return {
+          ...prev,
+          status: plan_status,
+          current_step_num,
+          steps: prev.steps.map(s => s.step_num === step.step_num ? step : s),
+        }
+      })
+    }
+  }, [])
+
+  // ── Data fetching ─────────────────────────────────────────────────────────────
+
   const fetchInitialData = useCallback(async () => {
     try {
-      const [incidentsRes, agentsRes] = await Promise.all([
+      const [incidentsRes, agentsRes, registryRes] = await Promise.all([
         fetch(`${API_URL}/incidents`),
         fetch(`${API_URL}/agents/status`),
+        fetch(`${API_URL}/agents/registry`),
       ])
       if (incidentsRes.ok) {
         const data = await incidentsRes.json()
@@ -39,44 +86,31 @@ export default function App() {
         agents.forEach(a => { statusMap[a.agent_name] = a })
         setAgentStatuses(prev => ({ ...prev, ...statusMap }))
       }
+      if (registryRes.ok) {
+        const data = await registryRes.json()
+        setRegistryAgents(data.agents || [])
+      }
     } catch (e) {
       console.warn('Could not fetch initial data:', e.message)
     }
   }, [])
 
-  const connectWS = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
-
-    const ws = new WebSocket(WS_URL)
-    wsRef.current = ws
-
-    ws.onopen = () => {
-      setWsConnected(true)
-      addEvent({ type: 'system', message: 'Connected to CodeOps Sentinel', timestamp: new Date().toISOString() })
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
-    }
-
-    ws.onclose = () => {
-      setWsConnected(false)
-      addEvent({ type: 'system', message: 'WebSocket disconnected. Reconnecting...', timestamp: new Date().toISOString() })
-      reconnectTimer.current = setTimeout(connectWS, 3000)
-    }
-
-    ws.onerror = () => {
-      addEvent({ type: 'error', message: 'WebSocket connection error', timestamp: new Date().toISOString() })
-    }
-
-    ws.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data)
-        handleWsMessage(msg)
-      } catch (err) {
-        console.warn('WS parse error:', err)
+  const fetchRegistry = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/agents/registry`)
+      if (res.ok) {
+        const data = await res.json()
+        setRegistryAgents(data.agents || [])
       }
+    } catch (e) {
+      console.warn('Registry fetch failed:', e.message)
     }
-  }, [addEvent])
+  }, [])
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────────
 
   const handleWsMessage = useCallback((msg) => {
+    // General event log
     addEvent({
       type: msg.event_type,
       agent: msg.agent,
@@ -86,20 +120,20 @@ export default function App() {
       timestamp: msg.timestamp,
     })
 
+    // State transition → update incident list
     if (msg.event_type === 'state_transition' && msg.data?.incident) {
       const updated = msg.data.incident
       setIncidents(prev => {
         const idx = prev.findIndex(i => i.id === updated.id)
         if (idx >= 0) {
-          const next = [...prev]
-          next[idx] = updated
-          return next
+          const next = [...prev]; next[idx] = updated; return next
         }
         return [updated, ...prev]
       })
       setActiveIncident(updated)
     }
 
+    // Agent activity → update agent status card
     if (msg.event_type === 'agent_activity' && msg.data?.agent) {
       const agentName = msg.data.agent
       setAgentStatuses(prev => ({
@@ -112,8 +146,6 @@ export default function App() {
           last_action_time: msg.timestamp,
         },
       }))
-
-      // Reset to idle after a delay
       setTimeout(() => {
         setAgentStatuses(prev => ({
           ...prev,
@@ -121,7 +153,45 @@ export default function App() {
         }))
       }, 3000)
     }
-  }, [addEvent])
+
+    // MCP call/response → update MCP flow view
+    if (msg.event_type === 'mcp_call' || msg.event_type === 'mcp_response') {
+      handleMcpCall(msg)
+    }
+
+    // Execution plan → update plan view
+    if (msg.event_type === 'plan_created' || msg.event_type === 'plan_step_update') {
+      handlePlanEvent(msg)
+    }
+  }, [addEvent, handleMcpCall, handlePlanEvent])
+
+  const connectWS = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return
+    const ws = new WebSocket(WS_URL)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      setWsConnected(true)
+      addEvent({ type: 'system', message: 'Connected to CodeOps Sentinel', timestamp: new Date().toISOString() })
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+    }
+    ws.onclose = () => {
+      setWsConnected(false)
+      addEvent({ type: 'system', message: 'WebSocket disconnected. Reconnecting...', timestamp: new Date().toISOString() })
+      reconnectTimer.current = setTimeout(connectWS, 3000)
+    }
+    ws.onerror = () => {
+      addEvent({ type: 'error', message: 'WebSocket connection error', timestamp: new Date().toISOString() })
+    }
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data)
+        handleWsMessage(msg)
+      } catch (err) {
+        console.warn('WS parse error:', err)
+      }
+    }
+  }, [addEvent, handleWsMessage])
 
   useEffect(() => {
     fetchInitialData()
@@ -132,7 +202,13 @@ export default function App() {
     }
   }, [fetchInitialData, connectWS])
 
+  // ── Actions ───────────────────────────────────────────────────────────────────
+
   const simulateIncident = async (scenarioIndex = null) => {
+    // Clear previous MCP events and plan when starting a new incident
+    setMcpEvents([])
+    setExecutionPlan(null)
+
     try {
       const url = scenarioIndex !== null
         ? `${API_URL}/incidents/simulate?scenario_index=${scenarioIndex}`
@@ -142,9 +218,7 @@ export default function App() {
         const incident = await res.json()
         setIncidents(prev => {
           const idx = prev.findIndex(i => i.id === incident.id)
-          if (idx >= 0) {
-            const next = [...prev]; next[idx] = incident; return next
-          }
+          if (idx >= 0) { const next = [...prev]; next[idx] = incident; return next }
           return [incident, ...prev]
         })
         setActiveIncident(incident)
@@ -161,11 +235,37 @@ export default function App() {
       setIncidents([])
       setActiveIncident(null)
       setEvents([])
-      setAgentStatuses(prev => Object.fromEntries(
-        Object.entries(prev).map(([k, v]) => [k, { ...v, status: 'idle', last_action: null }])
-      ))
+      setMcpEvents([])
+      setExecutionPlan(null)
+      setAgentStatuses(prev =>
+        Object.fromEntries(Object.entries(prev).map(([k, v]) => [k, { ...v, status: 'idle', last_action: null }]))
+      )
     } catch (e) {
       console.warn('Clear failed:', e)
+    }
+  }
+
+  const triggerMcpTool = async (toolName) => {
+    try {
+      const res = await fetch(
+        `${API_URL}/mcp/call?tool_name=${encodeURIComponent(toolName)}&from_agent=dashboard`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service: 'test' }),
+        }
+      )
+      if (res.ok) {
+        addEvent({
+          type: 'mcp_call',
+          message: `Manual MCP call: ${toolName}`,
+          timestamp: new Date().toISOString(),
+        })
+        // Refresh registry after manual trigger
+        await fetchRegistry()
+      }
+    } catch (e) {
+      console.warn('MCP tool trigger failed:', e.message)
     }
   }
 
@@ -179,6 +279,10 @@ export default function App() {
       onSelectIncident={setActiveIncident}
       onSimulate={simulateIncident}
       onClear={clearAll}
+      mcpEvents={mcpEvents}
+      executionPlan={executionPlan}
+      registryAgents={registryAgents}
+      onTriggerTool={triggerMcpTool}
     />
   )
 }
