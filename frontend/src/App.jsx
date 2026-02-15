@@ -110,14 +110,16 @@ export default function App() {
   // ── WebSocket ─────────────────────────────────────────────────────────────────
 
   const handleWsMessage = useCallback((msg) => {
-    // General event log
+    // General event log — normalize to consistent shape for activity feed
     addEvent({
-      type: msg.event_type,
-      agent: msg.agent,
+      type:        msg.event_type,
+      agent:       msg.agent,
       incident_id: msg.incident_id,
-      message: msg.data?.message || msg.data?.action || msg.event_type,
-      data: msg.data,
-      timestamp: msg.timestamp,
+      message:     msg.data?.message || msg.data?.action || msg.event_type,
+      tool_name:   msg.data?.tool_name,
+      action:      msg.data?.action,
+      data:        msg.data,
+      timestamp:   msg.timestamp || new Date().toISOString(),
     })
 
     // State transition → update incident list
@@ -204,7 +206,25 @@ export default function App() {
 
   // ── Actions ───────────────────────────────────────────────────────────────────
 
-  const simulateIncident = async (scenarioIndex = null) => {
+  // Map SimulateButton string IDs → backend scenario indices
+  const SCENARIO_ID_MAP = {
+    cpu_spike:       0,
+    memory_leak:     1,
+    service_down:    2,
+    high_error_rate: 2,
+    slow_queries:    4,
+    network_latency: 3,
+    crash_loop:      5,
+    gateway_502:     6,
+    db_replica:      7,
+  }
+
+  const simulateIncident = async (scenarioArg = null) => {
+    // Accept either a string scenario ID or a numeric index
+    const scenarioIndex = typeof scenarioArg === 'string'
+      ? (SCENARIO_ID_MAP[scenarioArg] ?? null)
+      : scenarioArg
+
     // Clear previous MCP events and plan when starting a new incident
     setMcpEvents([])
     setExecutionPlan(null)
