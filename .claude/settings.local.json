@@ -1,7 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(\"C:/Users/jpabl/CodeOps_Sentinel/infra/main.bicep\":*)",
+      "Bash(\"C:/Users/jpabl/CodeOps_Sentinel/infra/deploy.sh\":*)",
+      "Bash(chmod:*)",
+      "Bash(\"C:/Users/jpabl/CodeOps_Sentinel/.github/workflows/ci-cd.yml\":*)",
+      "Bash(\"C:/Users/jpabl/CodeOps_Sentinel/docs/setup.md\":*)",
+      "Bash(\"C:/Users/jpabl/CodeOps_Sentinel/README.md\":*)",
+      "Bash(pwsh -NoProfile -Command:*)",
+      "Bash(az containerapp logs show:*)",
+      "Bash(az containerapp revision list:*)",
+      "Bash(az monitor log-analytics workspace list:*)",
+      "Bash(az monitor log-analytics query:*)",
+      "Bash(az extension add:*)",
+      "Bash(npm run build:*)"
     ]
   }
 }

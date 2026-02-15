@@ -19,8 +19,9 @@ class Settings(BaseSettings):
     # Application Configuration
     APP_ENV: str = "development"
     APP_NAME: str = "CodeOps Sentinel"
-    APP_VERSION: str = "1.0.0"
+    APP_VERSION: str = "2.0.0"
     DEBUG: bool = True
+    FRONTEND_URL: str = ""          # Optional: custom domain added to CORS allow list
 
     # Simulation mode — set to False when real Azure credentials are present.
     # FoundryService also auto-detects: if AZURE_OPENAI_KEY is set and

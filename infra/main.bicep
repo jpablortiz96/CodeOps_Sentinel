@@ -1,141 +1,91 @@
-// CodeOps Sentinel - Azure Infrastructure as Code
-// Deploy: az deployment group create --resource-group codeops-sentinel-rg --template-file main.bicep
+// ============================================================================
+// CodeOps Sentinel -- Azure Infrastructure (Bicep)
+// Provisions: Log Analytics, App Insights, ACR, Container Apps Environment.
+// The Container App itself is created by deploy.ps1 AFTER the image is built
+// in ACR -- this avoids the "image not found" error during Bicep deployment.
+// ============================================================================
 
-@description('Environment name')
-param appEnv string = 'production'
-
-@description('Azure region')
+@description('Location for all resources')
 param location string = resourceGroup().location
 
-@description('Backend container image')
-param backendImage string = 'ghcr.io/your-org/sentinel-backend:latest'
+@description('Environment tag')
+param environment string = 'production'
 
-@description('App Service SKU')
-param appServiceSku string = 'B2'
+@description('Azure Container Registry name (globally unique, alphanumeric only)')
+param acrName string = 'codeopssentinelacr'
 
-var appName = 'codeops-sentinel'
+@description('Backend Container App name (used to compute the final URL)')
+param backendAppName string = 'codeops-sentinel-api'
+
+// ---- Variables --------------------------------------------------------------
+var containerEnvName = 'codeops-sentinel-env'
+var logAnalyticsName = 'codeops-sentinel-logs'
+var appInsightsName  = 'codeops-sentinel-insights'
 var tags = {
-  project: 'codeops-sentinel'
-  environment: appEnv
-  managedBy: 'bicep'
+  project:     'CodeOps Sentinel'
+  environment: environment
+  hackathon:   'Microsoft-GitHub-AI'
 }
 
-// ── Log Analytics Workspace ────────────────────────────────
+// ---- Log Analytics Workspace ------------------------------------------------
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
-  name: '${appName}-logs'
+  name:     logAnalyticsName
   location: location
-  tags: tags
+  tags:     tags
   properties: {
-    sku: { name: 'PerGB2018' }
+    sku:             { name: 'PerGB2018' }
     retentionInDays: 30
-    features: {
-      enableLogAccessUsingOnlyResourcePermissions: true
-    }
   }
 }
 
-// ── Application Insights ───────────────────────────────────
+// ---- Application Insights ---------------------------------------------------
 resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
-  name: '${appName}-insights'
+  name:     appInsightsName
   location: location
-  tags: tags
-  kind: 'web'
+  tags:     tags
+  kind:     'web'
   properties: {
-    Application_Type: 'web'
+    Application_Type:    'web'
     WorkspaceResourceId: logAnalytics.id
+    IngestionMode:       'LogAnalytics'
   }
 }
 
-// ── Azure OpenAI Service ───────────────────────────────────
-resource openAiService 'Microsoft.CognitiveServices/accounts@2024-04-01-preview' = {
-  name: '${appName}-openai'
+// ---- Azure Container Registry -----------------------------------------------
+resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
+  name:     acrName
   location: location
-  tags: tags
-  kind: 'OpenAI'
-  sku: { name: 'S0' }
+  tags:     tags
+  sku:      { name: 'Basic' }
   properties: {
-    customSubDomainName: '${appName}-openai'
+    adminUserEnabled:    true
     publicNetworkAccess: 'Enabled'
   }
 }
 
-resource gpt4oDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-04-01-preview' = {
-  parent: openAiService
-  name: 'gpt-4o'
-  sku: {
-    name: 'Standard'
-    capacity: 40
-  }
+// ---- Container Apps Environment ---------------------------------------------
+// Consumption plan: no VM quota required.
+resource containerEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
+  name:     containerEnvName
+  location: location
+  tags:     tags
   properties: {
-    model: {
-      format: 'OpenAI'
-      name: 'gpt-4o'
-      version: '2024-08-06'
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: logAnalytics.properties.customerId
+        sharedKey:  logAnalytics.listKeys().primarySharedKey
+      }
     }
   }
 }
 
-// ── App Service Plan ───────────────────────────────────────
-resource appServicePlan 'Microsoft.Web/serverfarms@2023-12-01' = {
-  name: '${appName}-plan'
-  location: location
-  tags: tags
-  kind: 'linux'
-  sku: {
-    name: appServiceSku
-    tier: 'Basic'
-  }
-  properties: {
-    reserved: true  // Linux
-  }
-}
-
-// ── Backend: Azure App Service ─────────────────────────────
-resource backendApp 'Microsoft.Web/sites@2023-12-01' = {
-  name: '${appName}-api'
-  location: location
-  tags: tags
-  properties: {
-    serverFarmId: appServicePlan.id
-    siteConfig: {
-      linuxFxVersion: 'DOCKER|${backendImage}'
-      alwaysOn: true
-      webSocketsEnabled: true  // Required for WebSocket support
-      appSettings: [
-        { name: 'WEBSITES_ENABLE_APP_SERVICE_STORAGE', value: 'false' }
-        { name: 'DOCKER_REGISTRY_SERVER_URL', value: 'https://ghcr.io' }
-        { name: 'APP_ENV', value: appEnv }
-        { name: 'SIMULATION_MODE', value: 'false' }
-        { name: 'APPINSIGHTS_INSTRUMENTATIONKEY', value: appInsights.properties.InstrumentationKey }
-        { name: 'AZURE_OPENAI_ENDPOINT', value: openAiService.properties.endpoint }
-        { name: 'AZURE_MONITOR_WORKSPACE', value: logAnalytics.id }
-      ]
-    }
-    httpsOnly: true
-  }
-}
-
-// ── Frontend: Azure Static Web App ────────────────────────
-resource staticWebApp 'Microsoft.Web/staticSites@2023-12-01' = {
-  name: '${appName}-frontend'
-  location: location
-  tags: tags
-  sku: {
-    name: 'Standard'
-    tier: 'Standard'
-  }
-  properties: {
-    repositoryUrl: 'https://github.com/your-org/codeops-sentinel'
-    branch: 'main'
-    buildProperties: {
-      appLocation: '/frontend'
-      outputLocation: 'dist'
-    }
-  }
-}
-
-// ── Outputs ────────────────────────────────────────────────
-output backendUrl string = 'https://${backendApp.properties.defaultHostName}'
-output frontendUrl string = 'https://${staticWebApp.properties.defaultHostname}'
-output openAiEndpoint string = openAiService.properties.endpoint
-output logAnalyticsWorkspaceId string = logAnalytics.properties.customerId
+// ---- Outputs ----------------------------------------------------------------
+// deploy.ps1 uses these to create the Container App after the image is built.
+output acrLoginServer     string = acr.properties.loginServer
+output acrName            string = acr.name
+output containerEnvName   string = containerEnv.name
+output containerEnvDomain string = containerEnv.properties.defaultDomain
+output appInsightsConnStr string = appInsights.properties.ConnectionString
+// Pre-compute the final backend URL: https://<appName>.<envDomain>
+output backendUrl         string = 'https://${backendAppName}.${containerEnv.properties.defaultDomain}'

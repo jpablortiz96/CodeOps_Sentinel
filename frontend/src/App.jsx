@@ -1,8 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import Dashboard from './components/Dashboard.jsx'
-
-const WS_URL  = 'ws://localhost:8000/ws'
-const API_URL = 'http://localhost:8000/api'
+import { API_URL, WS_URL } from './config.js'
 
 export default function App() {
   const [incidents, setIncidents]         = useState([])

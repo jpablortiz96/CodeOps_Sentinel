@@ -1,156 +1,144 @@
-# Setup Guide — CodeOps Sentinel
+# CodeOps Sentinel — Deployment Guide
 
-## Local Development (Simulation Mode)
+## Prerequisites
 
-This mode requires no Azure or GitHub credentials. All external calls are mocked.
+| Tool | Version | Install |
+|------|---------|---------|
+| Azure CLI | ≥ 2.60 | https://aka.ms/installazurecliwindows |
+| Docker Desktop | ≥ 24 | https://www.docker.com/products/docker-desktop |
+| Node.js | 20 LTS | https://nodejs.org |
+| Python | 3.12+ | https://python.org |
+| PowerShell | 7+ | Pre-installed on Windows 11 |
 
-### Backend
+You also need:
+- An **Azure Subscription** with Contributor rights on `CodeOpsSentinel-rg`
+- An **Azure OpenAI** resource with a `gpt-4o` deployment (or set `SIMULATION_MODE=true`)
 
-```bash
-cd backend
+---
 
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+## Environment Variables
 
-# Install dependencies
-pip install -r requirements.txt
+Create `backend/.env`:
 
-# Create .env (simulation mode is default)
-cp .env.example .env
-
-# Start the API server
-uvicorn app.main:app --reload --port 8000
+```
+AZURE_OPENAI_ENDPOINT=https://your-instance.openai.azure.com/
+AZURE_OPENAI_KEY=your-api-key
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+SIMULATION_MODE=false
+GITHUB_TOKEN=ghp_yourtoken
+GITHUB_REPO=your-org/your-repo
+APP_ENV=development
 ```
 
-Verify: `curl http://localhost:8000/health`
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AZURE_OPENAI_ENDPOINT` | Real AI only | — | Azure OpenAI endpoint URL |
+| `AZURE_OPENAI_KEY` | Real AI only | — | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT` | No | gpt-4o | Model deployment name |
+| `SIMULATION_MODE` | No | true | false = real Azure OpenAI |
+| `GITHUB_TOKEN` | No | — | For GitHub patch integration |
+| `FRONTEND_URL` | No | — | Custom domain for CORS |
 
-### Frontend
+---
+
+## Local Development
 
 ```bash
+# Backend
+cd backend
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+
+# Frontend (new terminal)
 cd frontend
-
-# Install dependencies
 npm install
-
-# Start dev server
 npm run dev
 ```
 
-Open `http://localhost:3000`
+- Dashboard: http://localhost:5173
+- API: http://localhost:8000
+- Swagger: http://localhost:8000/docs
 
 ---
 
-## Production Setup (Real Azure APIs)
+## Deploy to Azure — One Command
 
-### Prerequisites
+**Windows (PowerShell — RECOMMENDED):**
 
-1. Azure subscription with these services provisioned:
-   - Azure OpenAI Service with GPT-4o deployment
-   - Azure Log Analytics Workspace
-   - Azure App Service (for backend)
-   - Azure Static Web Apps (for frontend)
-
-2. GitHub account with:
-   - Personal Access Token with `repo` scope
-   - Repository to monitor
-
-### Configuration
-
-```bash
-cp .env.example backend/.env
-```
-
-Edit `backend/.env`:
-
-```env
-SIMULATION_MODE=false
-
-# Azure OpenAI
-AZURE_OPENAI_ENDPOINT=https://your-instance.openai.azure.com/
-AZURE_OPENAI_KEY=<your-key>
-AZURE_OPENAI_DEPLOYMENT=gpt-4o
-
-# Azure Monitor
-AZURE_SUBSCRIPTION_ID=<your-subscription-id>
-AZURE_RESOURCE_GROUP=<your-resource-group>
-AZURE_MONITOR_WORKSPACE=<log-analytics-workspace-id>
-
-# GitHub
-GITHUB_TOKEN=ghp_<your-pat>
-GITHUB_REPO=your-org/your-repo
-```
-
-### Deploy to Azure
-
-```bash
-# Login
+```powershell
+$env:AZURE_OPENAI_ENDPOINT = "https://your-instance.openai.azure.com/"
+$env:AZURE_OPENAI_KEY      = "your-api-key"
 az login
-
-# Deploy infrastructure and application
-chmod +x infra/deploy.sh
-./infra/deploy.sh production
+.\infra\deploy.ps1
 ```
 
----
-
-## Docker
+**Linux/macOS (Bash):**
 
 ```bash
-# Build and run full stack
-docker-compose up --build
-
-# Backend only
-docker build -t sentinel-backend ./backend
-docker run -p 8000:8000 --env-file backend/.env sentinel-backend
-
-# Frontend only
-docker build -t sentinel-frontend ./frontend
-docker run -p 3000:3000 sentinel-frontend
+export AZURE_OPENAI_ENDPOINT="https://your-instance.openai.azure.com/"
+export AZURE_OPENAI_KEY="your-api-key"
+az login
+chmod +x infra/deploy.sh && ./infra/deploy.sh
 ```
+
+The script performs 8 steps automatically:
+
+1. Validates Azure CLI login
+2. Creates/updates `CodeOpsSentinel-rg` resource group
+3. Deploys all Azure resources via Bicep (ACR, App Service Plan, App Service, App Insights, Log Analytics)
+4. Builds backend Docker image via **ACR Tasks** (no local Docker required)
+5. Builds frontend Docker image via **ACR Tasks**
+6. Configures all App Settings including secrets
+7. Enables WebSockets + restarts App Service
+8. Polls `/health` until backend reports `healthy`
 
 ---
 
-## GitHub Actions CI/CD
+## CI/CD Setup (GitHub Actions)
 
-Add these secrets to your GitHub repository:
+### Required Secrets
 
-| Secret | Description |
-|--------|-------------|
-| `AZURE_CREDENTIALS` | Azure service principal JSON |
-| `AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
-| `AZURE_RESOURCE_GROUP` | Resource group name |
-| `AZURE_STATIC_WEB_APPS_API_TOKEN` | Static Web Apps deployment token |
+Go to **GitHub repo → Settings → Secrets and variables → Actions**:
 
-The CI/CD pipeline (`ci-cd.yml`) automatically:
-1. Runs Python tests and linting on every PR
-2. Builds and validates the React app
-3. On merge to `main`: builds Docker images, pushes to GHCR, deploys to Azure
+| Secret | How to get |
+|--------|------------|
+| `AZURE_CREDENTIALS` | `az ad sp create-for-rbac --sdk-auth` (see below) |
+| `AZURE_OPENAI_ENDPOINT` | Your Azure OpenAI endpoint |
+| `AZURE_OPENAI_KEY` | Your Azure OpenAI API key |
+| `AZURE_STATIC_WEB_APPS_API_TOKEN` | `az staticwebapp secrets list --name ...` |
+
+```bash
+# Create service principal
+az ad sp create-for-rbac \
+  --name "codeops-sentinel-cicd" \
+  --role Contributor \
+  --scopes /subscriptions/<SUB_ID>/resourceGroups/CodeOpsSentinel-rg \
+  --sdk-auth
+# Copy the JSON output → AZURE_CREDENTIALS secret
+```
+
+After adding secrets, any push to `main` triggers the full pipeline.
 
 ---
 
 ## Troubleshooting
 
-**Backend won't start**
+**WebSocket disconnects in Azure:**
 ```bash
-# Check Python version
-python --version  # Needs 3.12+
-
-# Re-install dependencies
-pip install -r requirements.txt --upgrade
+az webapp config set --name codeops-sentinel-api \
+  --resource-group CodeOpsSentinel-rg --web-sockets-enabled true
 ```
 
-**Frontend can't connect to backend**
-- Ensure backend is running on port 8000
-- Check browser console for CORS errors
-- Vite proxy (`vite.config.js`) handles `/api` and `/ws` forwarding automatically in dev
+**View backend logs:**
+```bash
+az webapp log tail --name codeops-sentinel-api \
+  --resource-group CodeOpsSentinel-rg
+```
 
-**WebSocket shows "Offline"**
-- Backend must be running and healthy
-- Check `http://localhost:8000/health`
-- The frontend auto-reconnects every 3 seconds
+**ACR name already taken:** ACR names are globally unique — pass a custom name:
+```powershell
+.\infra\deploy.ps1 -AcrName "myuniquename123"
+```
 
-**Simulation incidents not progressing**
-- Check backend logs for errors
-- Verify `SIMULATION_MODE=true` in `.env`
-- Each incident runs as a background task; check `uvicorn` output
+**Frontend can't reach backend:** Set `FRONTEND_URL=https://your-app.azurestaticapps.net`
+in the backend App Service → Configuration → Application settings.
