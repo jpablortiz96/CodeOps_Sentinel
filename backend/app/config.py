@@ -1,5 +1,15 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+# Resolve .env: check CWD first, then parent (handles both
+# "uvicorn from backend/app/" and "WORKDIR /app" in Docker).
+_env_candidates = [
+    Path.cwd() / ".env",               # e.g. backend/app/.env or /app/.env
+    Path.cwd().parent / ".env",         # e.g. backend/.env  or /app/../.env
+    Path(__file__).resolve().parent.parent / ".env",  # backend/.env (relative to config.py)
+]
+_ENV_FILE = next((p for p in _env_candidates if p.is_file()), ".env")
 
 
 class Settings(BaseSettings):
@@ -13,7 +23,7 @@ class Settings(BaseSettings):
 
     # GitHub Configuration
     GITHUB_TOKEN: str = ""
-    GITHUB_REPO: str = "your-org/your-repo"
+    GITHUB_REPO: str = "jpablortiz96/CodeOps_Sentinel"
     GITHUB_BASE_BRANCH: str = "main"
 
     # Application Configuration
@@ -49,7 +59,7 @@ class Settings(BaseSettings):
     ALERT_LATENCY_MS_DEGRADED: float = 500.0
 
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
         env_file_encoding = "utf-8"
         extra = "ignore"
 

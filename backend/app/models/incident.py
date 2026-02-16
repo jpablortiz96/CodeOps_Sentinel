@@ -67,6 +67,9 @@ class Incident(BaseModel):
     error_count: int = 0
     affected_users: int = 0
     metrics_snapshot: dict = Field(default_factory=dict)
+    github_pr_url: Optional[str] = None
+    github_pr_number: Optional[int] = None
+    github_branch: Optional[str] = None
 
     def add_timeline_event(self, agent: str, action: str, details: str, status: str = "info"):
         event = IncidentTimeline(

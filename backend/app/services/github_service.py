@@ -1,113 +1,315 @@
 """
-GitHub API integration service.
-Handles PR creation, branch management, and Copilot Agent Mode integration.
+GitHub REST API integration — async via httpx.
+
+Creates real branches, commits fix files, and opens Pull Requests
+when the Fixer Agent remediates an incident.  Falls back gracefully
+when GITHUB_TOKEN is empty or the API returns errors.
 """
+import base64
 import logging
-import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+import httpx
 
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+_API = "https://api.github.com"
+
 
 class GitHubService:
+    """Thin async wrapper around the GitHub REST API v3."""
+
     def __init__(self):
-        self.token = settings.GITHUB_TOKEN
-        self.repo = settings.GITHUB_REPO
-        self.base_branch = settings.GITHUB_BASE_BRANCH
-        self._simulation = settings.SIMULATION_MODE
+        self.token: str = settings.GITHUB_TOKEN
+        self.repo: str = settings.GITHUB_REPO          # "owner/repo"
+        self.base_branch: str = settings.GITHUB_BASE_BRANCH
 
-    async def create_branch(self, branch_name: str, from_branch: str = None) -> dict:
-        """Create a new branch for the fix."""
-        if self._simulation:
-            return {
-                "name": branch_name,
-                "sha": "a" * 40,
-                "url": f"https://github.com/{self.repo}/tree/{branch_name}",
-            }
+    # ── helpers ──────────────────────────────────────────────────────────────
 
-        try:
-            from github import Github
-            g = Github(self.token)
-            repo = g.get_repo(self.repo)
-            base = repo.get_branch(from_branch or self.base_branch)
-            repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base.commit.sha)
-            return {"name": branch_name, "sha": base.commit.sha}
-        except Exception as e:
-            logger.error(f"GitHub: Failed to create branch {branch_name}: {e}")
-            return {"name": branch_name, "sha": "simulated", "error": str(e)}
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token)
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github.v3+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    def _url(self, path: str) -> str:
+        return f"{_API}/repos/{self.repo}{path}"
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        timeout: float = 15.0,
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.request(
+                method,
+                self._url(path),
+                headers=self._headers(),
+                json=json,
+            )
+        return resp
+
+    # ── (a) create fix branch ────────────────────────────────────────────────
+
+    async def create_fix_branch(self, incident_id: str) -> str:
+        """
+        Create ``fix/agent-{incident_id}-{ts}`` from the tip of *main*.
+        Returns the branch name.
+        """
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        branch_name = f"fix/agent-{incident_id.lower()}-{ts}"
+
+        # 1. Get SHA of main
+        resp = await self._request("GET", f"/git/refs/heads/{self.base_branch}")
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"GitHub: cannot read ref {self.base_branch} — {resp.status_code}: {resp.text[:200]}"
+            )
+        sha = resp.json()["object"]["sha"]
+
+        # 2. Create branch ref
+        resp = await self._request(
+            "POST",
+            "/git/refs",
+            json={"ref": f"refs/heads/{branch_name}", "sha": sha},
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"GitHub: cannot create branch {branch_name} — {resp.status_code}: {resp.text[:200]}"
+            )
+
+        logger.info(f"[GITHUB] Branch created: {branch_name} (from {sha[:8]})")
+        return branch_name
+
+    # ── (b) create fix file (commit to branch) ──────────────────────────────
+
+    async def create_fix_file(
+        self,
+        branch: str,
+        incident_id: str,
+        diagnosis: dict,
+        fix_content: str,
+        original_code: str = "",
+        fixed_code: str = "",
+        resolution_time: str = "",
+    ) -> str:
+        """
+        Commit a Markdown fix-report into ``fixes/{incident_id}.md``.
+        Returns the commit SHA.
+        """
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        root_cause = diagnosis.get("root_cause", "Unknown")
+        severity = diagnosis.get("severity", "unknown")
+        affected = diagnosis.get("affected_services", [])
+        if isinstance(affected, list):
+            affected = ", ".join(affected)
+
+        md = (
+            f"# Incident Fix: {incident_id}\n\n"
+            f"## Diagnosis\n"
+            f"- **Root Cause**: {root_cause}\n"
+            f"- **Severity**: {severity}\n"
+            f"- **Affected Services**: {affected}\n"
+            f"- **Detected At**: {now}\n\n"
+            f"## Recommended Fix\n"
+            f"{fix_content}\n\n"
+            f"## Code Changes\n"
+            f"```python\n"
+            f"# Original code (problematic)\n"
+            f"{original_code or '# N/A'}\n\n"
+            f"# Fixed code\n"
+            f"{fixed_code or '# N/A'}\n"
+            f"```\n\n"
+            f"## Auto-Remediation Applied\n"
+            f"- **Action**: Stopped chaos experiment via API\n"
+            f"- **Result**: Service recovered\n"
+            f"- **Resolution Time**: {resolution_time or 'N/A'}\n\n"
+            f"## Generated by\n"
+            f"CodeOps Sentinel — Fixer Agent v2.0  \n"
+            f"Powered by Azure OpenAI GPT-4o + Microsoft Agent Framework\n"
+        )
+
+        encoded = base64.b64encode(md.encode()).decode()
+        path = f"fixes/{incident_id}.md"
+        commit_msg = f"fix: auto-remediation for {incident_id} — {root_cause[:80]}"
+
+        resp = await self._request(
+            "PUT",
+            f"/contents/{path}",
+            json={
+                "message": commit_msg,
+                "content": encoded,
+                "branch": branch,
+            },
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"GitHub: cannot create file {path} — {resp.status_code}: {resp.text[:200]}"
+            )
+
+        sha = resp.json().get("commit", {}).get("sha", "unknown")
+        logger.info(f"[GITHUB] File committed: {path} on {branch} ({sha[:8]})")
+        return sha
+
+    # ── (c) create pull request ──────────────────────────────────────────────
 
     async def create_pull_request(
         self,
-        title: str,
-        body: str,
-        head_branch: str,
-        base_branch: Optional[str] = None,
+        branch: str,
+        incident_id: str,
+        diagnosis: dict,
+        metrics_before: Optional[dict] = None,
+        metrics_after: Optional[dict] = None,
     ) -> dict:
-        """Create a Pull Request with the fix."""
-        if self._simulation:
-            pr_number = random.randint(100, 999)
-            return {
-                "number": pr_number,
-                "url": f"https://github.com/{self.repo}/pull/{pr_number}",
-                "title": title,
-                "state": "open",
-                "created_at": datetime.utcnow().isoformat(),
-                "labels": ["auto-remediation", "security"],
-            }
+        """
+        Open a PR from *branch* → *main*.
+        Returns ``{pr_number, pr_url, branch, status}``.
+        """
+        root_cause = diagnosis.get("root_cause", "Unknown")
+        severity = diagnosis.get("severity", "unknown")
+        affected = diagnosis.get("affected_services", [])
+        if isinstance(affected, list):
+            affected = ", ".join(affected)
 
-        try:
-            from github import Github
-            g = Github(self.token)
-            repo = g.get_repo(self.repo)
-            pr = repo.create_pull(
-                title=title,
-                body=body,
-                head=head_branch,
-                base=base_branch or self.base_branch,
+        title = f"\U0001f916 Auto-Fix: {root_cause[:60]} [{incident_id}]"
+
+        # Build body
+        before_block = ""
+        if metrics_before:
+            before_block = (
+                f"| Metric | Before | After |\n"
+                f"|--------|--------|-------|\n"
+                f"| Memory | {metrics_before.get('memory_usage_mb', '?')} MB"
+                f" | {metrics_after.get('memory_usage_mb', '?') if metrics_after else '?'} MB |\n"
+                f"| CPU | {metrics_before.get('cpu_percent', '?')}%"
+                f" | {metrics_after.get('cpu_percent', '?') if metrics_after else '?'}% |\n"
+                f"| Error Rate | {metrics_before.get('error_rate', '?')}%"
+                f" | {metrics_after.get('error_rate', '?') if metrics_after else '?'}% |\n"
+                f"| Latency | {metrics_before.get('avg_latency_ms', '?')} ms"
+                f" | {metrics_after.get('avg_latency_ms', '?') if metrics_after else '?'} ms |\n"
             )
-            return {
-                "number": pr.number,
-                "url": pr.html_url,
-                "title": pr.title,
-                "state": pr.state,
-            }
-        except Exception as e:
-            logger.error(f"GitHub: Failed to create PR: {e}")
-            pr_number = random.randint(100, 999)
-            return {"number": pr_number, "url": f"https://github.com/{self.repo}/pull/{pr_number}", "simulated": True}
 
-    async def get_workflow_runs(self, branch: Optional[str] = None) -> list:
-        """Get recent GitHub Actions workflow runs."""
-        if self._simulation:
-            return [
-                {
-                    "id": random.randint(10000, 99999),
-                    "name": "CI/CD Pipeline",
-                    "status": random.choice(["completed", "in_progress", "queued"]),
-                    "conclusion": random.choice(["success", "failure", "success", "success"]),
-                    "branch": branch or self.base_branch,
-                    "created_at": datetime.utcnow().isoformat(),
-                    "url": f"https://github.com/{self.repo}/actions/runs/{random.randint(10000, 99999)}",
-                }
-                for _ in range(3)
-            ]
-        return []
+        body = (
+            f"## Summary\n"
+            f"Automated fix for incident **{incident_id}**.\n\n"
+            f"## Diagnosis\n"
+            f"- **Root Cause**: {root_cause}\n"
+            f"- **Severity**: {severity}\n"
+            f"- **Affected Services**: {affected}\n\n"
+            f"## Actions Taken\n"
+            f"1. Detected anomaly via real-time monitoring\n"
+            f"2. Ran AI-powered diagnosis (Azure OpenAI GPT-4o)\n"
+            f"3. Stopped active chaos experiments via `/chaos/stop`\n"
+            f"4. Verified service recovery via `/health`\n"
+            f"5. Generated fix documentation and opened this PR\n\n"
+        )
+        if before_block:
+            body += f"## Metrics Before / After\n{before_block}\n"
+        body += (
+            f"---\n"
+            f"> \U0001f916 Generated by **CodeOps Sentinel** — Fixer Agent v2.0  \n"
+            f"> Powered by Azure OpenAI GPT-4o + Microsoft Agent Framework\n"
+        )
 
-    async def trigger_copilot_agent(self, context: str, file_path: str) -> dict:
-        """
-        Simulate GitHub Copilot Agent Mode for code generation.
-        In production, this would use the Copilot API.
-        """
-        logger.info(f"GitHubService: Triggering Copilot Agent for {file_path}")
+        resp = await self._request(
+            "POST",
+            "/pulls",
+            json={
+                "title": title,
+                "body": body,
+                "head": branch,
+                "base": self.base_branch,
+            },
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"GitHub: cannot create PR — {resp.status_code}: {resp.text[:300]}"
+            )
+
+        pr = resp.json()
+        pr_number = pr["number"]
+        pr_url = pr["html_url"]
+
+        # Best-effort: add labels
+        try:
+            await self._request(
+                "POST",
+                f"/issues/{pr_number}/labels",
+                json={"labels": ["auto-fix", "agent-generated"]},
+            )
+        except Exception:
+            pass  # labels are optional
+
+        logger.info(f"[GITHUB] PR #{pr_number} created: {pr_url}")
         return {
-            "status": "generated",
-            "file_path": file_path,
-            "suggestions": 3,
-            "applied": 1,
-            "confidence": random.uniform(0.80, 0.97),
-            "model": "github-copilot-4",
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "branch": branch,
+            "status": "open",
         }
+
+    # ── (d) get PR status ────────────────────────────────────────────────────
+
+    async def get_pr_status(self, pr_number: int) -> dict:
+        """Fetch current state of a PR."""
+        resp = await self._request("GET", f"/pulls/{pr_number}")
+        if resp.status_code != 200:
+            return {"error": f"HTTP {resp.status_code}"}
+        data = resp.json()
+        return {
+            "pr_number": data["number"],
+            "pr_url": data["html_url"],
+            "state": data["state"],
+            "merged": data.get("merged", False),
+            "title": data["title"],
+        }
+
+    # ── (e) list agent-generated PRs ─────────────────────────────────────────
+
+    async def list_agent_prs(self, state: str = "all") -> list[dict]:
+        """List PRs with the *agent-generated* label."""
+        resp = await self._request(
+            "GET",
+            f"/pulls?state={state}&per_page=20&sort=created&direction=desc",
+        )
+        if resp.status_code != 200:
+            return []
+        prs = resp.json()
+        # Filter client-side by label
+        out = []
+        for pr in prs:
+            labels = [l["name"] for l in pr.get("labels", [])]
+            if "agent-generated" in labels:
+                out.append({
+                    "pr_number": pr["number"],
+                    "pr_url": pr["html_url"],
+                    "title": pr["title"],
+                    "state": pr["state"],
+                    "merged": pr.get("merged", False),
+                    "created_at": pr["created_at"],
+                    "labels": labels,
+                })
+        return out
+
+
+# Singleton
+_github_service: GitHubService | None = None
+
+
+def get_github_service() -> GitHubService:
+    global _github_service
+    if _github_service is None:
+        _github_service = GitHubService()
+    return _github_service

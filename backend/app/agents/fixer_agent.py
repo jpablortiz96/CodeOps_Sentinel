@@ -22,6 +22,7 @@ from config import get_settings
 from models.incident import Incident, Diagnosis, Fix
 from models.agent_messages import AgentStatus
 from services.foundry_service import get_foundry_service
+from services.github_service import get_github_service
 from .agent_prompts import FIXER_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -288,17 +289,134 @@ class FixerAgent:
             return {"success": False, "error": str(exc)}
 
     async def create_pull_request(self, incident: Incident, fix: Fix, diagnosis: Diagnosis) -> dict:
-        """Create a GitHub Pull Request for the generated fix."""
-        await asyncio.sleep(0.5)
-        pr_number = random.randint(100, 999)
-        branch = f"auto-fix/{incident.id.lower()}-{fix.fix_id}"
-        return {
-            "number": pr_number,
-            "url": f"https://github.com/your-org/your-repo/pull/{pr_number}",
-            "title": (
-                f"fix({incident.service}): {fix.description[:60]} "
-                f"[auto-remediation {incident.id}]"
-            ),
-            "branch": branch,
-            "labels": ["auto-remediation", f"severity:{diagnosis.severity}"],
-        }
+        """Create a GitHub Pull Request for the generated fix.
+
+        Uses the real GitHub REST API when GITHUB_TOKEN is configured;
+        falls back to a simulated PR dict otherwise.
+        """
+        gh = get_github_service()
+        if not gh.enabled:
+            logger.info("[FIXER] GitHub integration disabled (no GITHUB_TOKEN)")
+            pr_number = random.randint(100, 999)
+            branch = f"auto-fix/{incident.id.lower()}-{fix.fix_id}"
+            return {
+                "number": pr_number,
+                "url": f"https://github.com/{settings.GITHUB_REPO}/pull/{pr_number}",
+                "title": f"fix({incident.service}): {fix.description[:60]}",
+                "branch": branch,
+                "simulated": True,
+            }
+
+        # Real GitHub PR flow
+        from api.websocket import manager as ws_manager
+
+        diag_dict = diagnosis.model_dump() if diagnosis else {}
+
+        try:
+            # Step 1 — Branch
+            incident.add_timeline_event(
+                agent=self.name,
+                action="Creating Fix Branch",
+                details=f"Creating branch fix/agent-{incident.id}… on GitHub",
+                status="info",
+            )
+            await ws_manager.broadcast_event(
+                event_type="agent_activity",
+                data={"message": f"Creating fix branch: fix/agent-{incident.id}…"},
+                agent=self.name,
+                incident_id=incident.id,
+            )
+            branch = await gh.create_fix_branch(incident.id)
+
+            # Step 2 — Commit fix file
+            incident.add_timeline_event(
+                agent=self.name,
+                action="Committing Fix Documentation",
+                details=f"Committing fix report to fixes/{incident.id}.md on branch {branch}",
+                status="info",
+            )
+            await ws_manager.broadcast_event(
+                event_type="agent_activity",
+                data={"message": f"Committing fix documentation to {branch}…"},
+                agent=self.name,
+                incident_id=incident.id,
+            )
+            await gh.create_fix_file(
+                branch=branch,
+                incident_id=incident.id,
+                diagnosis=diag_dict,
+                fix_content=fix.description,
+                original_code=fix.original_code,
+                fixed_code=fix.fixed_code,
+            )
+
+            # Step 3 — Open PR
+            incident.add_timeline_event(
+                agent=self.name,
+                action="Opening Pull Request",
+                details="Opening PR on GitHub…",
+                status="info",
+            )
+            pr_result = await gh.create_pull_request(
+                branch=branch,
+                incident_id=incident.id,
+                diagnosis=diag_dict,
+                metrics_before=incident.metrics_snapshot,
+            )
+
+            # Store on incident
+            incident.github_pr_url = pr_result["pr_url"]
+            incident.github_pr_number = pr_result["pr_number"]
+            incident.github_branch = branch
+
+            # Broadcast PR created event for the dashboard
+            await ws_manager.broadcast_event(
+                event_type="github_pr_created",
+                data={
+                    "pr_number": pr_result["pr_number"],
+                    "pr_url": pr_result["pr_url"],
+                    "branch": branch,
+                    "incident_id": incident.id,
+                    "title": f"Auto-Fix: {diagnosis.root_cause[:60]}",
+                },
+                agent=self.name,
+                incident_id=incident.id,
+            )
+            await ws_manager.broadcast_event(
+                event_type="agent_activity",
+                data={
+                    "message": (
+                        f"✅ PR created: #{pr_result['pr_number']} — "
+                        f"{pr_result['pr_url']}"
+                    ),
+                },
+                agent=self.name,
+                incident_id=incident.id,
+            )
+
+            logger.info(
+                f"[FIXER] Real GitHub PR #{pr_result['pr_number']} created for {incident.id}"
+            )
+            return {
+                "number": pr_result["pr_number"],
+                "url": pr_result["pr_url"],
+                "branch": branch,
+            }
+
+        except Exception as exc:
+            logger.error(f"[FIXER] GitHub PR creation failed: {exc}")
+            incident.add_timeline_event(
+                agent=self.name,
+                action="GitHub PR Failed",
+                details=f"PR creation failed: {exc}. Pipeline continues.",
+                status="warning",
+            )
+            # Fallback — don't break the pipeline
+            pr_number = random.randint(100, 999)
+            return {
+                "number": pr_number,
+                "url": f"https://github.com/{settings.GITHUB_REPO}/pull/{pr_number}",
+                "branch": f"auto-fix/{incident.id.lower()}-{fix.fix_id}",
+                "simulated": True,
+                "error": str(exc),
+            }

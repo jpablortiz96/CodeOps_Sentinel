@@ -389,3 +389,19 @@ async def monitoring_thresholds():
             },
         },
     }
+
+
+# ── GitHub integration ─────────────────────────────────────────────────────────
+
+@router.get("/github/prs")
+async def list_github_prs(state: str = "all"):
+    """List Pull Requests created by the Fixer Agent (label: agent-generated)."""
+    from services.github_service import get_github_service
+    gh = get_github_service()
+    if not gh.enabled:
+        return {"prs": [], "enabled": False, "message": "GitHub integration disabled (no GITHUB_TOKEN)"}
+    try:
+        prs = await gh.list_agent_prs(state=state)
+        return {"prs": prs, "enabled": True, "count": len(prs)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}")

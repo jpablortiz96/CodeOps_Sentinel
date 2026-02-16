@@ -2,6 +2,7 @@ import { useMemo, useState, useEffect } from 'react'
 import {
   Activity, AlertTriangle, CheckCircle, Clock,
   Cpu, TrendingUp, Zap, Shield, MemoryStick, Gauge, Radio,
+  GitPullRequest, ExternalLink,
 } from 'lucide-react'
 import AnimatedNumber from './common/AnimatedNumber'
 import StatusBadge from './common/StatusBadge'
@@ -185,21 +186,23 @@ function PipelineConnector({ active }) {
 function ActivityFeed({ events = [] }) {
   const typeStyle = (type) => {
     switch (type) {
-      case 'mcp_call':        return 'log-mcp'
-      case 'agent_activity':  return 'log-info'
-      case 'state_transition': return 'log-success'
-      case 'error':           return 'log-error'
-      default:                return 'log-info'
+      case 'mcp_call':          return 'log-mcp'
+      case 'agent_activity':    return 'log-info'
+      case 'state_transition':  return 'log-success'
+      case 'github_pr_created': return 'log-success'
+      case 'error':             return 'log-error'
+      default:                  return 'log-info'
     }
   }
 
   const typePrefix = (type) => {
     switch (type) {
-      case 'mcp_call':        return '[MCP]'
-      case 'agent_activity':  return '[AGT]'
-      case 'state_transition':return '[STA]'
-      case 'plan_step_update':return '[PLN]'
-      default:                return '[SYS]'
+      case 'mcp_call':           return '[MCP]'
+      case 'agent_activity':     return '[AGT]'
+      case 'state_transition':   return '[STA]'
+      case 'plan_step_update':   return '[PLN]'
+      case 'github_pr_created':  return '[PR]'
+      default:                   return '[SYS]'
     }
   }
 
@@ -211,10 +214,25 @@ function ActivityFeed({ events = [] }) {
         events.slice(-50).reverse().map((ev, i) => (
           <div key={i} className="log-entry mcp-row-enter">
             <span className="log-ts">{formatTime(ev.timestamp ?? new Date().toISOString())}</span>
-            <span className={`flex-shrink-0 ${typeStyle(ev.type)}`}>{typePrefix(ev.type)}</span>
-            <span className="text-gray-400 truncate">
-              {ev.message ?? ev.tool_name ?? ev.action ?? ev.type}
-            </span>
+            <span className={`flex-shrink-0 ${typeStyle(ev.type ?? ev.event_type)}`}>{typePrefix(ev.type ?? ev.event_type)}</span>
+            {(ev.type === 'github_pr_created' || ev.event_type === 'github_pr_created') ? (
+              <span className="text-purple-400 truncate">
+                🤖 Fixer Agent created{' '}
+                <a
+                  href={ev.data?.pr_url ?? ev.pr_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-purple-300 underline hover:text-purple-200"
+                >
+                  PR #{ev.data?.pr_number ?? ev.pr_number}
+                </a>
+                {': '}{ev.data?.title ?? ''}
+              </span>
+            ) : (
+              <span className="text-gray-400 truncate">
+                {ev.message ?? ev.data?.message ?? ev.tool_name ?? ev.action ?? ev.type}
+              </span>
+            )}
           </div>
         ))
       )}
@@ -246,6 +264,22 @@ function IncidentBanner({ incident }) {
           <StatusBadge status={incident.status} />
         </div>
         <p className="text-xs text-gray-400 mt-0.5 truncate">{incident.description}</p>
+        {incident.github_pr_url && (
+          <a
+            href={incident.github_pr_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 mt-1.5 px-2.5 py-1 rounded-lg
+                       bg-purple-500/10 border border-purple-500/30
+                       text-purple-400 text-xs font-semibold font-mono
+                       hover:bg-purple-500/20 hover:border-purple-500/50
+                       transition-all duration-200 group"
+          >
+            <GitPullRequest size={12} />
+            PR #{incident.github_pr_number}
+            <ExternalLink size={10} className="opacity-50 group-hover:opacity-100 transition-opacity" />
+          </a>
+        )}
         <p className="text-xs text-gray-600 mt-1">
           {formatRelative(incident.detected_at ?? incident.timestamp)}
           {incident.service && ` · ${incident.service}`}

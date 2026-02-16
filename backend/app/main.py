@@ -32,6 +32,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# ─── Startup diagnostics (never log secrets) ─────────────────────────────────
+logger.info(f"GITHUB_TOKEN loaded: {bool(settings.GITHUB_TOKEN)}")
+logger.info(f"GITHUB_REPO: {settings.GITHUB_REPO}")
+logger.info(f"SIMULATION_MODE: {settings.SIMULATION_MODE}")
+logger.info(f"env_file resolved to: {settings.Config.env_file}")
+
 
 # ─── Request logging middleware ───────────────────────────────────────────────
 class RequestLogMiddleware(BaseHTTPMiddleware):
