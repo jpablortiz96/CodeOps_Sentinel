@@ -13,7 +13,8 @@ from typing import Dict, List, Optional
 import psutil
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from chaos import chaos_state, router as chaos_router
@@ -143,11 +144,27 @@ app = FastAPI(
 app.add_middleware(ObservabilityMiddleware)
 app.include_router(chaos_router)
 
+# ── Static files ──────────────────────────────────────────────────────────────
+import pathlib as _pathlib
+_static_dir = _pathlib.Path(__file__).resolve().parent / "static"
+if _static_dir.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
+    """Serve the e-commerce storefront HTML."""
+    index = _static_dir / "index.html"
+    if index.is_file():
+        return FileResponse(str(index), media_type="text/html")
+    # Fallback to JSON if static files not present
+    return {"app": "ShopDemo API", "version": "1.0.0", "docs": "/docs"}
+
+
+@app.get("/api/info")
+async def api_info():
     proc = psutil.Process()
     mem_mb = proc.memory_info().rss / 1_048_576
     uptime = time.time() - START_TIME
@@ -166,6 +183,11 @@ async def root():
         "errors":      err_count,
         "active_chaos": active_chaos,
     }
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return PlainTextResponse("", status_code=204)
 
 
 @app.get("/health")

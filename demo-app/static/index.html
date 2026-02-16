@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ShopDemo — E-Commerce Store</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --blue: #0078d4;
+    --blue-dark: #005a9e;
+    --green: #107c10;
+    --yellow: #d48c00;
+    --red: #d13438;
+    --bg: #f5f6fa;
+    --card: #ffffff;
+    --text: #1a1a2e;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --radius: 12px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 2px 8px rgba(0,0,0,0.04);
+  }
+
+  body {
+    font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* ── Status Banner (sticky) ───────────────────────────────────── */
+  #status-banner {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    padding: 10px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 13px;
+    font-weight: 600;
+    transition: background 0.4s, color 0.4s;
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(12px);
+  }
+  #status-banner.healthy  { background: rgba(16,124,16,0.07); color: var(--green); }
+  #status-banner.degraded { background: rgba(212,140,0,0.09); color: var(--yellow); }
+  #status-banner.critical { background: rgba(209,52,56,0.09); color: var(--red); animation: pulse-bg 1.5s ease-in-out infinite; }
+
+  @keyframes pulse-bg {
+    0%,100% { opacity: 1; }
+    50% { opacity: 0.85; }
+  }
+
+  .status-metrics {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .status-metric {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+  }
+  .status-metric .bar-track {
+    width: 60px;
+    height: 6px;
+    background: #e5e7eb;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .status-metric .bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.6s ease, background 0.4s;
+  }
+  .chaos-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: rgba(209,52,56,0.1);
+    color: var(--red);
+    border: 1px solid rgba(209,52,56,0.2);
+  }
+
+  /* ── Alert Banner ─────────────────────────────────────────────── */
+  #alert-banner {
+    text-align: center;
+    padding: 12px 24px;
+    font-size: 13px;
+    font-weight: 600;
+    transition: all 0.4s ease;
+    overflow: hidden;
+  }
+  #alert-banner.hidden { max-height: 0; padding: 0 24px; opacity: 0; }
+  #alert-banner.warning { max-height: 60px; opacity: 1; background: #fff3cd; color: #856404; border-bottom: 1px solid #ffc107; }
+  #alert-banner.resolved { max-height: 60px; opacity: 1; background: #d4edda; color: #155724; border-bottom: 1px solid #28a745; }
+
+  /* ── Header ───────────────────────────────────────────────────── */
+  header {
+    background: white;
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .logo h1 {
+    font-size: 22px;
+    font-weight: 800;
+    color: var(--text);
+  }
+  .logo h1 span { color: var(--blue); }
+  .logo-badge {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    background: rgba(0,120,212,0.08);
+    color: var(--blue);
+    font-weight: 600;
+    border: 1px solid rgba(0,120,212,0.15);
+  }
+
+  /* ── Nav ───────────────────────────────────────────────────────── */
+  nav {
+    display: flex;
+    gap: 4px;
+    background: var(--bg);
+    padding: 4px;
+    border-radius: 10px;
+  }
+  nav button {
+    padding: 8px 18px;
+    border: none;
+    background: transparent;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  nav button:hover { color: var(--text); background: rgba(0,0,0,0.03); }
+  nav button.active { background: white; color: var(--blue); box-shadow: var(--shadow); }
+
+  /* ── Main ──────────────────────────────────────────────────────── */
+  main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  .section { display: none; }
+  .section.active { display: block; }
+
+  /* ── Product Grid ──────────────────────────────────────────────── */
+  .product-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+  }
+  .product-card {
+    background: var(--card);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .product-card:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+  .product-top { display: flex; justify-content: space-between; align-items: flex-start; }
+  .product-cat {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--blue);
+    padding: 2px 8px;
+    background: rgba(0,120,212,0.07);
+    border-radius: 6px;
+  }
+  .product-sku { font-size: 11px; color: var(--muted); font-family: monospace; }
+  .product-name { font-size: 16px; font-weight: 700; }
+  .product-bottom { display: flex; justify-content: space-between; align-items: center; margin-top: auto; }
+  .product-price { font-size: 20px; font-weight: 800; color: var(--blue); }
+  .stock-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 20px;
+  }
+  .stock-badge.in-stock { background: #d4edda; color: var(--green); }
+  .stock-badge.low-stock { background: #fff3cd; color: #856404; }
+  .stock-badge.out { background: #f8d7da; color: var(--red); }
+  .btn-cart {
+    width: 100%;
+    padding: 10px;
+    border: none;
+    border-radius: 8px;
+    background: var(--blue);
+    color: white;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .btn-cart:hover { background: var(--blue-dark); }
+  .btn-cart:disabled { background: #ccc; cursor: not-allowed; }
+
+  /* ── Orders ────────────────────────────────────────────────────── */
+  .order-actions { margin-bottom: 16px; }
+  .btn-primary {
+    padding: 10px 24px;
+    border: none;
+    border-radius: 8px;
+    background: var(--blue);
+    color: white;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .btn-primary:hover { background: var(--blue-dark); }
+  .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+  .order-list { display: flex; flex-direction: column; gap: 10px; }
+  .order-card {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .order-id { font-family: monospace; font-weight: 700; color: var(--blue); }
+  .order-total { font-weight: 700; font-size: 16px; }
+  .order-status {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 20px;
+    background: #d4edda;
+    color: var(--green);
+  }
+  .order-time { font-size: 12px; color: var(--muted); }
+  .empty-state {
+    text-align: center;
+    padding: 48px 24px;
+    color: var(--muted);
+  }
+  .empty-state .icon { font-size: 40px; margin-bottom: 8px; }
+
+  /* ── Status Panel ──────────────────────────────────────────────── */
+  .status-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+  .status-card {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .status-card-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 8px;
+  }
+  .status-card-value {
+    font-size: 28px;
+    font-weight: 800;
+    margin-bottom: 8px;
+    transition: color 0.3s;
+  }
+  .status-card .bar-track {
+    width: 100%;
+    height: 8px;
+    background: #e5e7eb;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .status-card .bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.6s ease, background 0.4s;
+  }
+  .chaos-list {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .chaos-list h3 { font-size: 14px; font-weight: 700; margin-bottom: 10px; }
+  .chaos-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    margin: 4px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    background: rgba(209,52,56,0.07);
+    color: var(--red);
+    border: 1px solid rgba(209,52,56,0.15);
+  }
+  .no-chaos {
+    font-size: 13px;
+    color: var(--green);
+    font-weight: 600;
+  }
+
+  /* ── Toast ─────────────────────────────────────────────────────── */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: white;
+    background: var(--green);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    transform: translateY(80px);
+    opacity: 0;
+    transition: all 0.3s ease;
+    z-index: 200;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.error { background: var(--red); }
+
+  /* ── Footer ────────────────────────────────────────────────────── */
+  footer {
+    text-align: center;
+    padding: 24px;
+    font-size: 12px;
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    margin-top: 40px;
+    background: white;
+  }
+  footer a { color: var(--blue); text-decoration: none; }
+
+  /* ── Responsive ────────────────────────────────────────────────── */
+  @media (max-width: 600px) {
+    main { padding: 16px; }
+    .product-grid { grid-template-columns: 1fr; }
+    .status-grid { grid-template-columns: 1fr 1fr; }
+    .status-metrics { gap: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ── Status Banner ─────────────────────────────────────────────── -->
+<div id="status-banner" class="healthy">
+  <div style="display:flex;align-items:center;gap:10px;">
+    <span id="status-icon">&#9679;</span>
+    <span id="status-text">All Systems Operational</span>
+    <span id="chaos-tags"></span>
+  </div>
+  <div class="status-metrics" id="banner-metrics">
+    <div class="status-metric">
+      Mem <strong id="bm-mem">—</strong> MB
+      <div class="bar-track"><div class="bar-fill" id="bm-mem-bar"></div></div>
+    </div>
+    <div class="status-metric">
+      CPU <strong id="bm-cpu">—</strong>%
+      <div class="bar-track"><div class="bar-fill" id="bm-cpu-bar"></div></div>
+    </div>
+    <div class="status-metric">
+      Err <strong id="bm-err">—</strong>%
+      <div class="bar-track"><div class="bar-fill" id="bm-err-bar"></div></div>
+    </div>
+    <div class="status-metric">
+      Lat <strong id="bm-lat">—</strong> ms
+      <div class="bar-track"><div class="bar-fill" id="bm-lat-bar"></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Alert Banner ──────────────────────────────────────────────── -->
+<div id="alert-banner" class="hidden"></div>
+
+<!-- ── Header ────────────────────────────────────────────────────── -->
+<header>
+  <div class="logo">
+    <h1>&#128722; Shop<span>Demo</span></h1>
+    <span class="logo-badge">Protected by CodeOps Sentinel &#128737;&#65039;</span>
+  </div>
+  <nav>
+    <button class="active" onclick="showTab('products')">Products</button>
+    <button onclick="showTab('orders')">Orders</button>
+    <button onclick="showTab('status')">System Status</button>
+  </nav>
+</header>
+
+<!-- ── Main Content ──────────────────────────────────────────────── -->
+<main>
+
+  <!-- Products -->
+  <div id="tab-products" class="section active">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h2 style="font-size:18px;font-weight:700;">Product Catalog</h2>
+      <span id="product-count" style="font-size:13px;color:var(--muted);"></span>
+    </div>
+    <div id="product-grid" class="product-grid">
+      <div class="empty-state"><div class="icon">&#128722;</div>Loading products...</div>
+    </div>
+  </div>
+
+  <!-- Orders -->
+  <div id="tab-orders" class="section">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:12px;">
+      <h2 style="font-size:18px;font-weight:700;">Orders</h2>
+      <div class="order-actions">
+        <button class="btn-primary" id="btn-random-order" onclick="placeRandomOrder()">
+          &#127922; Place Random Order
+        </button>
+      </div>
+    </div>
+    <div id="order-list" class="order-list">
+      <div class="empty-state"><div class="icon">&#128230;</div>No orders yet. Place one!</div>
+    </div>
+  </div>
+
+  <!-- System Status -->
+  <div id="tab-status" class="section">
+    <h2 style="font-size:18px;font-weight:700;margin-bottom:16px;">System Health</h2>
+    <div class="status-grid">
+      <div class="status-card">
+        <div class="status-card-label">Memory Usage</div>
+        <div class="status-card-value" id="sc-mem">—</div>
+        <div class="bar-track"><div class="bar-fill" id="sc-mem-bar"></div></div>
+      </div>
+      <div class="status-card">
+        <div class="status-card-label">CPU Utilization</div>
+        <div class="status-card-value" id="sc-cpu">—</div>
+        <div class="bar-track"><div class="bar-fill" id="sc-cpu-bar"></div></div>
+      </div>
+      <div class="status-card">
+        <div class="status-card-label">Error Rate</div>
+        <div class="status-card-value" id="sc-err">—</div>
+        <div class="bar-track"><div class="bar-fill" id="sc-err-bar"></div></div>
+      </div>
+      <div class="status-card">
+        <div class="status-card-label">Avg Latency</div>
+        <div class="status-card-value" id="sc-lat">—</div>
+        <div class="bar-track"><div class="bar-fill" id="sc-lat-bar"></div></div>
+      </div>
+    </div>
+    <div class="status-grid" style="grid-template-columns:1fr 1fr;">
+      <div class="status-card">
+        <div class="status-card-label">Uptime</div>
+        <div class="status-card-value" id="sc-uptime" style="font-size:20px;">—</div>
+      </div>
+      <div class="status-card">
+        <div class="status-card-label">Total Requests</div>
+        <div class="status-card-value" id="sc-reqs" style="font-size:20px;">—</div>
+      </div>
+    </div>
+    <div class="chaos-list" id="chaos-panel">
+      <h3>Active Chaos Experiments</h3>
+      <div id="chaos-items" class="no-chaos">&#10003; No active experiments — system nominal</div>
+    </div>
+  </div>
+
+</main>
+
+<!-- ── Toast ──────────────────────────────────────────────────────── -->
+<div class="toast" id="toast"></div>
+
+<!-- ── Footer ────────────────────────────────────────────────────── -->
+<footer>
+  ShopDemo v1.0 &mdash; A demo e-commerce app monitored by
+  <a href="https://github.com/jpablortiz96/CodeOps_Sentinel" target="_blank">CodeOps Sentinel</a>
+</footer>
+
+<script>
+/* ── State ──────────────────────────────────────────────────────── */
+let products = [];
+let lastStatus = 'healthy';
+
+/* ── Tab navigation ─────────────────────────────────────────────── */
+function showTab(name) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+}
+
+/* ── Toast ───────────────────────────────────────────────────────── */
+let toastTimer;
+function toast(msg, isError) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isError ? ' error' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = 'toast', 3000);
+}
+
+/* ── Bar color helper ────────────────────────────────────────────── */
+function barColor(pct) {
+  if (pct > 80) return 'var(--red)';
+  if (pct > 50) return 'var(--yellow)';
+  return 'var(--green)';
+}
+function valColor(pct) {
+  if (pct > 80) return 'var(--red)';
+  if (pct > 50) return 'var(--yellow)';
+  return 'var(--text)';
+}
+
+/* ── Load products ───────────────────────────────────────────────── */
+async function loadProducts() {
+  try {
+    const resp = await fetch('/products');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    products = data.products || [];
+    renderProducts();
+  } catch (e) {
+    document.getElementById('product-grid').innerHTML =
+      '<div class="empty-state"><div class="icon">&#9888;&#65039;</div>Failed to load products: ' + e.message + '</div>';
+  }
+}
+
+function renderProducts() {
+  const grid = document.getElementById('product-grid');
+  document.getElementById('product-count').textContent = products.length + ' items';
+  if (!products.length) {
+    grid.innerHTML = '<div class="empty-state"><div class="icon">&#128722;</div>No products found</div>';
+    return;
+  }
+  grid.innerHTML = products.map(p => {
+    const stockClass = p.stock === 0 ? 'out' : p.stock < 20 ? 'low-stock' : 'in-stock';
+    const stockLabel = p.stock === 0 ? 'Out of Stock' : p.stock < 20 ? 'Low Stock: ' + p.stock : 'In Stock: ' + p.stock;
+    return `
+      <div class="product-card">
+        <div class="product-top">
+          <span class="product-cat">${p.category}</span>
+          <span class="product-sku">${p.sku}</span>
+        </div>
+        <div class="product-name">${p.name}</div>
+        <div class="product-bottom">
+          <span class="product-price">$${p.price.toFixed(2)}</span>
+          <span class="stock-badge ${stockClass}">${stockLabel}</span>
+        </div>
+        <button class="btn-cart" ${p.stock === 0 ? 'disabled' : ''} onclick="addToCart(${p.id})">
+          ${p.stock === 0 ? 'Sold Out' : 'Add to Cart'}
+        </button>
+      </div>
+    `;
+  }).join('');
+}
+
+/* ── Add to cart (create single-item order) ──────────────────────── */
+async function addToCart(productId) {
+  try {
+    const resp = await fetch('/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        items: [{ product_id: productId, quantity: 1 }],
+        customer_email: 'demo@shopdemo.io'
+      })
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || 'HTTP ' + resp.status);
+    }
+    const order = await resp.json();
+    toast('Order #' + order.id + ' placed — $' + order.total.toFixed(2));
+    loadProducts();
+    loadOrders();
+  } catch (e) {
+    toast('Order failed: ' + e.message, true);
+  }
+}
+
+/* ── Load orders ─────────────────────────────────────────────────── */
+async function loadOrders() {
+  try {
+    const resp = await fetch('/orders');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    renderOrders(data.orders || []);
+  } catch (e) {
+    document.getElementById('order-list').innerHTML =
+      '<div class="empty-state"><div class="icon">&#9888;&#65039;</div>' + e.message + '</div>';
+  }
+}
+
+function renderOrders(orders) {
+  const list = document.getElementById('order-list');
+  if (!orders.length) {
+    list.innerHTML = '<div class="empty-state"><div class="icon">&#128230;</div>No orders yet. Place one!</div>';
+    return;
+  }
+  list.innerHTML = orders.sort((a,b) => b.created_at - a.created_at).map(o => {
+    const d = new Date(o.created_at * 1000);
+    const time = d.toLocaleTimeString();
+    return `
+      <div class="order-card">
+        <div>
+          <span class="order-id">#${o.id}</span>
+          <span class="order-time">&nbsp;&middot;&nbsp;${time}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span class="order-status">${o.status}</span>
+          <span class="order-total">$${o.total.toFixed(2)}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+/* ── Place random order ──────────────────────────────────────────── */
+async function placeRandomOrder() {
+  if (!products.length) { toast('No products loaded', true); return; }
+  const btn = document.getElementById('btn-random-order');
+  btn.disabled = true;
+  btn.textContent = 'Placing...';
+
+  const available = products.filter(p => p.stock > 0);
+  if (!available.length) { toast('All products are out of stock', true); btn.disabled = false; btn.textContent = '\u{1F3B2} Place Random Order'; return; }
+
+  const pick = available[Math.floor(Math.random() * available.length)];
+  const qty = Math.min(pick.stock, Math.floor(Math.random() * 3) + 1);
+
+  try {
+    const resp = await fetch('/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        items: [{ product_id: pick.id, quantity: qty }],
+        customer_email: 'demo@shopdemo.io'
+      })
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || 'HTTP ' + resp.status);
+    }
+    const order = await resp.json();
+    toast('Order #' + order.id + ': ' + qty + 'x ' + pick.name + ' — $' + order.total.toFixed(2));
+    loadProducts();
+    loadOrders();
+  } catch (e) {
+    toast('Order failed: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '\u{1F3B2} Place Random Order';
+  }
+}
+
+/* ── Health polling ──────────────────────────────────────────────── */
+async function pollHealth() {
+  try {
+    const resp = await fetch('/health');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const h = await resp.json();
+    updateStatusUI(h);
+  } catch (e) {
+    updateStatusUI({
+      status: 'critical',
+      memory_usage_mb: 0, cpu_percent: 0,
+      error_rate: 100, avg_latency_ms: 9999,
+      active_chaos: [], uptime_seconds: 0, request_count: 0,
+    });
+  }
+}
+
+function updateStatusUI(h) {
+  const banner = document.getElementById('status-banner');
+  const alertEl = document.getElementById('alert-banner');
+
+  // Banner class
+  banner.className = h.status;
+
+  // Status text
+  const icons = { healthy: '\u{1F7E2}', degraded: '\u{1F7E1}', critical: '\u{1F534}' };
+  const labels = { healthy: 'All Systems Operational', degraded: 'System Degraded', critical: 'CRITICAL — Service Impacted' };
+  document.getElementById('status-icon').textContent = icons[h.status] || '\u{26AA}';
+  document.getElementById('status-text').textContent = labels[h.status] || h.status;
+
+  // Metrics — banner
+  const mem = h.memory_usage_mb || 0;
+  const cpu = h.cpu_percent || 0;
+  const err = h.error_rate || 0;
+  const lat = h.avg_latency_ms || 0;
+
+  document.getElementById('bm-mem').textContent = mem.toFixed(0);
+  document.getElementById('bm-cpu').textContent = cpu.toFixed(0);
+  document.getElementById('bm-err').textContent = err.toFixed(1);
+  document.getElementById('bm-lat').textContent = lat.toFixed(0);
+
+  const memPct = Math.min(100, (mem / 600) * 100);
+  const cpuPct = Math.min(100, cpu);
+  const errPct = Math.min(100, err);
+  const latPct = Math.min(100, (lat / 5000) * 100);
+
+  setBar('bm-mem-bar', memPct);
+  setBar('bm-cpu-bar', cpuPct);
+  setBar('bm-err-bar', errPct);
+  setBar('bm-lat-bar', latPct);
+
+  // Metrics — status page cards
+  document.getElementById('sc-mem').textContent = mem.toFixed(1) + ' MB';
+  document.getElementById('sc-mem').style.color = valColor(memPct);
+  setBar('sc-mem-bar', memPct);
+
+  document.getElementById('sc-cpu').textContent = cpu.toFixed(1) + '%';
+  document.getElementById('sc-cpu').style.color = valColor(cpuPct);
+  setBar('sc-cpu-bar', cpuPct);
+
+  document.getElementById('sc-err').textContent = err.toFixed(2) + '%';
+  document.getElementById('sc-err').style.color = valColor(errPct);
+  setBar('sc-err-bar', errPct);
+
+  document.getElementById('sc-lat').textContent = lat.toFixed(0) + ' ms';
+  document.getElementById('sc-lat').style.color = valColor(latPct);
+  setBar('sc-lat-bar', latPct);
+
+  // Uptime + requests
+  const mins = Math.floor((h.uptime_seconds || 0) / 60);
+  const secs = Math.floor((h.uptime_seconds || 0) % 60);
+  document.getElementById('sc-uptime').textContent = mins + 'm ' + secs + 's';
+  document.getElementById('sc-reqs').textContent = (h.request_count || 0).toLocaleString();
+
+  // Chaos tags in banner
+  const chaos = h.active_chaos || [];
+  const tagsEl = document.getElementById('chaos-tags');
+  tagsEl.innerHTML = chaos.map(c =>
+    '<span class="chaos-tag">\u{26A1} ' + c.replace(/_active$/, '').replace(/_/g, '-') + '</span>'
+  ).join(' ');
+
+  // Chaos panel on status page
+  const chaosItems = document.getElementById('chaos-items');
+  if (chaos.length) {
+    chaosItems.className = '';
+    chaosItems.innerHTML = chaos.map(c =>
+      '<span class="chaos-item">\u{1F525} ' + c.replace(/_active$/, '').replace(/_/g, ' ') + '</span>'
+    ).join('');
+  } else {
+    chaosItems.className = 'no-chaos';
+    chaosItems.innerHTML = '\u{2713} No active experiments &mdash; system nominal';
+  }
+
+  // Alert banner logic
+  if (h.status !== 'healthy' && lastStatus === 'healthy') {
+    alertEl.className = 'warning';
+    alertEl.textContent = '\u{26A0}\u{FE0F} ANOMALY DETECTED \u2014 CodeOps Sentinel agents are investigating...';
+  } else if (h.status === 'healthy' && lastStatus !== 'healthy') {
+    alertEl.className = 'resolved';
+    alertEl.textContent = '\u{2705} RESOLVED \u2014 Agents successfully remediated the issue';
+    setTimeout(() => { alertEl.className = 'hidden'; }, 6000);
+  } else if (h.status === 'healthy' && lastStatus === 'healthy') {
+    // keep hidden (unless resolved banner is showing)
+    if (alertEl.className === 'warning') alertEl.className = 'hidden';
+  }
+  lastStatus = h.status;
+}
+
+function setBar(id, pct) {
+  const el = document.getElementById(id);
+  el.style.width = pct + '%';
+  el.style.background = barColor(pct);
+}
+
+/* ── Init ────────────────────────────────────────────────────────── */
+loadProducts();
+loadOrders();
+pollHealth();
+setInterval(pollHealth, 3000);
+</script>
+</body>
+</html>
