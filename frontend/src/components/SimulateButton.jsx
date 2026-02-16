@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   Zap, X, AlertTriangle, Database, Cpu, Globe,
-  HardDrive, StopCircle, Loader,
+  HardDrive, StopCircle, Loader, Server,
 } from 'lucide-react'
 import { API_URL } from '../config'
 
